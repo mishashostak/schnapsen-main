@@ -122,21 +122,70 @@ class AlphaBetaBot(Bot):
 
 
 class OneFixedMoveBot(Bot):
+    """
+    Plays exactly one predetermined move, but makes it legal in the CURRENT state copy
+    by selecting the matching move from perspective.valid_moves().
+
+    This is necessary because engine.play_one_trick() copies GameState, and Card objects
+    (and sometimes Move instances) may not be identical across copies.
+    """
+
     def __init__(self, move: Move) -> None:
         super().__init__(name=None)
-        self.first_move: Optional[Move] = move
+        self._move: Optional[Move] = move
+
+        # Store a "descriptor" for matching later
+        self._cls = move.__class__
+        self._has_card = hasattr(move, "card")
+        if self._has_card:
+            c = move.card  # type: ignore[attr-defined]
+            self._rank = c.rank
+            self._suit = c.suit
+        else:
+            self._rank = None
+            self._suit = None
 
     def get_move(self, perspective: PlayerPerspective, leader_move: Optional[Move]) -> Move:
-        assert self.first_move is not None, "This bot can only play one move, after that it ends"
-        move = self.first_move
-        self.first_move = None
-        return move
+        assert self._move is not None, "This bot can only play one move, after that it ends"
+
+        # Consume it (one-shot bot)
+        self._move = None
+
+        # Choose a legal move from this *current* perspective that matches our descriptor
+        candidates = perspective.valid_moves()
+
+        # First: strict match by class + card identity by (rank,suit)
+        if self._has_card:
+            for m in candidates:
+                if m.__class__ is self._cls and hasattr(m, "card"):
+                    mc = m.card  # type: ignore[attr-defined]
+                    if mc.rank == self._rank and mc.suit == self._suit:
+                        return m
+
+            # Second: looser match: any move with same card (rank,suit), regardless of class
+            for m in candidates:
+                if hasattr(m, "card"):
+                    mc = m.card  # type: ignore[attr-defined]
+                    if mc.rank == self._rank and mc.suit == self._suit:
+                        return m
+
+        # If we get here, we couldn't match it. Fallback to a legal move
+        # rather than crashing the search engine.
+        return candidates[0]
 
 
 # =============================================================================
 # Phase-1: PERFECT-INFO AlphaBeta (cheats by peeking full GameState)
 # =============================================================================
-def _rig_to_all_trumps(perspective: PlayerPerspective) -> None:
+def _rig_to_opening_hand(perspective: PlayerPerspective) -> None:
+    """
+    Research rig (Phase 1, at game start only):
+
+    - Ensure the trump Jack is the face-up trump card at the bottom of the talon (talon_cards[-1]).
+      Never modify talon_cards[-1] after that.
+    - Force our hand to: A♠(trump), 10♠(trump), K♠(trump), Q♠(trump) + one Ace (prefer non-trump Ace).
+    - Maintain invariants via 1-for-1 swaps only.
+    """
     state: GameState = perspective._PlayerPerspective__game_state  # type: ignore[attr-defined]
     trump_suit = state.talon.trump_suit()
 
@@ -152,43 +201,209 @@ def _rig_to_all_trumps(perspective: PlayerPerspective) -> None:
     opp_cards: List[Any] = list(opp.hand.cards)
     talon_cards: List[Any] = list(getattr(state.talon, "_cards", []))
 
-    # Pick 5 trump cards (these are unique card objects)
-    all_trumps = [c for c in (my_cards + opp_cards + talon_cards) if c.suit == trump_suit]
-    if len(all_trumps) < 5:
-        return
-    in_my_hand = [c for c in my_cards if c.suit == trump_suit]
-    not_in_my_hand = [c for c in all_trumps if c not in my_cards]
-    target_trumps = (in_my_hand + not_in_my_hand)[:5]
+    if not talon_cards:
+        return  # shouldn't happen in phase 1
 
-    # Cards we need to steal (target trumps not already in my hand)
-    missing_trumps = [t for t in target_trumps if t not in my_cards]
+    def rank_name(c: Any) -> str:
+        r = getattr(c, "rank", None)
+        return getattr(r, "name", str(r))
 
-    # Cards we will give back = exactly the cards currently in my hand that are not in target_trumps
-    give_back = [c for c in my_cards if c not in target_trumps]
+    def is_trump(c: Any) -> bool:
+        return getattr(c, "suit", None) == trump_suit
 
-    # In a 5-card hand, these counts must match for a clean 1-for-1 swap
-    if len(give_back) != len(missing_trumps):
-        # Safety fallback: do nothing rather than break invariants
-        return
+    # ----------------------------
+    # Step 1: Move trump Jack to talon bottom and protect it
+    # ----------------------------
+    trump_jack = None
+    # find trump jack in the whole pool
+    for c in my_cards + opp_cards + talon_cards:
+        if is_trump(c) and rank_name(c) == "JACK":
+            trump_jack = c
+            break
+    if trump_jack is None:
+        return  # unexpected, but don't corrupt state
 
-    # For each missing trump, swap it out of opp or talon with one give-back card
-    for t, g in zip(missing_trumps, give_back):
-        if t in opp_cards:
-            idx = opp_cards.index(t)
-            opp_cards[idx] = g
-        elif t in talon_cards:
-            idx = talon_cards.index(t)
-            talon_cards[idx] = g
+    bottom_idx = len(talon_cards) - 1
+    bottom_card = talon_cards[bottom_idx]
+
+    if trump_jack is not bottom_card:
+        # Put trump_jack at bottom, swap the displaced bottom_card back to where jack came from
+        if trump_jack in talon_cards:
+            j_idx = talon_cards.index(trump_jack)
+            # swap within talon (safe because bottom_card is trump suit already)
+            talon_cards[j_idx], talon_cards[bottom_idx] = talon_cards[bottom_idx], talon_cards[j_idx]
+        elif trump_jack in my_cards:
+            j_idx = my_cards.index(trump_jack)
+            my_cards[j_idx] = bottom_card
+            talon_cards[bottom_idx] = trump_jack
+        elif trump_jack in opp_cards:
+            j_idx = opp_cards.index(trump_jack)
+            opp_cards[j_idx] = bottom_card
+            talon_cards[bottom_idx] = trump_jack
         else:
-            # Shouldn't happen, but don't corrupt state if it does
             return
 
-    # Now my hand is exactly the 5 target trumps (no cards lost, none duplicated)
-    me.hand.cards[:] = target_trumps
-    opp.hand.cards[:] = opp_cards
-    if hasattr(state.talon, "_cards"):
-        state.talon._cards[:] = talon_cards  # type: ignore[attr-defined]
+    protected = talon_cards[bottom_idx]  # this is now the trump jack
+    # Never touch talon_cards[bottom_idx] again.
 
+    # ----------------------------
+    # Step 2: Build desired opening hand
+    # ----------------------------
+    pool = [c for c in (my_cards + opp_cards + talon_cards) if c is not protected]
+
+    def find_card(pred) -> Optional[Any]:
+        for c in pool:
+            if pred(c):
+                return c
+        return None
+
+    trump_ace = find_card(lambda c: is_trump(c) and rank_name(c) == "ACE")
+    trump_ten = find_card(lambda c: is_trump(c) and rank_name(c) == "TEN")
+    trump_king = find_card(lambda c: is_trump(c) and rank_name(c) == "KING")
+    trump_queen = find_card(lambda c: is_trump(c) and rank_name(c) == "QUEEN")
+
+    if None in (trump_ace, trump_ten, trump_king, trump_queen):
+        return  # don't partially rig if something is weird
+
+    # 5th card: an Ace, preferably non-trump
+    non_trump_ace = find_card(lambda c: (not is_trump(c)) and rank_name(c) == "ACE")
+    any_extra_ace = find_card(lambda c: rank_name(c) == "ACE" and c not in {trump_ace, trump_ten, trump_king, trump_queen})
+    fifth = non_trump_ace or any_extra_ace
+    if fifth is None:
+        return
+
+    desired = [trump_ace, trump_ten, trump_king, trump_queen, fifth]
+
+    # If we already have exactly these 5 cards, just write back any prior swaps and exit
+    if set(desired) == set(my_cards):
+        me.hand.cards[:] = my_cards
+        opp.hand.cards[:] = opp_cards
+        state.talon._cards[:] = talon_cards  # type: ignore[attr-defined]
+        return
+
+    # ----------------------------
+    # Step 3: 1-for-1 swap to make our hand exactly "desired"
+    # ----------------------------
+    missing = [c for c in desired if c not in my_cards]
+    give_back = [c for c in my_cards if c not in desired]
+
+    if len(missing) != len(give_back):
+        return  # safety: avoid breaking invariants
+
+    for take, give in zip(missing, give_back):
+        if take in opp_cards:
+            idx = opp_cards.index(take)
+            opp_cards[idx] = give
+        elif take in talon_cards:
+            idx = talon_cards.index(take)
+            # NEVER touch the protected bottom card
+            if idx == bottom_idx:
+                return
+            talon_cards[idx] = give
+        else:
+            return
+
+    # Set our hand to the exact desired cards
+    my_cards = desired
+
+    # ----------------------------
+    # Step 4: Write back mutated lists (preserve invariants)
+    # ----------------------------
+    me.hand.cards[:] = my_cards
+    opp.hand.cards[:] = opp_cards
+    state.talon._cards[:] = talon_cards  # type: ignore[attr-defined]
+
+
+# --- Card ordering: trump dominates, then rank strength (A > 10 > K > Q > J) ---
+_RANK_STRENGTH = {
+    "ACE": 5,
+    "TEN": 4,
+    "KING": 3,
+    "QUEEN": 2,
+    "JACK": 1,
+}
+
+def _rank_name(card: Any) -> str:
+    r = getattr(card, "rank", None)
+    return getattr(r, "name", str(r))
+
+def _card_strength(card: Any, trump_suit: Any) -> tuple[int, int]:
+    """Sort key: (is_trump, rank_strength). Higher is better."""
+    is_trump = 1 if getattr(card, "suit", None) == trump_suit else 0
+    return (is_trump, _RANK_STRENGTH.get(_rank_name(card), 0))
+
+def _rig_to_best_five(perspective: PlayerPerspective) -> None:
+    state: GameState = perspective._PlayerPerspective__game_state  # type: ignore[attr-defined]
+    trump_suit = state.talon.trump_suit()
+
+    if perspective.am_i_leader():
+        me = state.leader
+        opp = state.follower
+    else:
+        me = state.follower
+        opp = state.leader
+
+    my_cards: List[Any] = list(me.hand.cards)
+    opp_cards: List[Any] = list(opp.hand.cards)
+    talon_cards: List[Any] = list(getattr(state.talon, "_cards", []))
+
+    if not talon_cards:
+        return
+    protected = talon_cards[-1]               # face-up trump card (your trump jack)
+    bottom_idx = len(talon_cards) - 1
+
+    def rank_name(card: Any) -> str:
+        r = getattr(card, "rank", None)
+        return getattr(r, "name", str(r))
+
+    _RANK_STRENGTH = {"ACE": 5, "TEN": 4, "KING": 3, "QUEEN": 2, "JACK": 1}
+
+    def card_strength(card: Any) -> tuple[int, int]:
+        is_trump = 1 if getattr(card, "suit", None) == trump_suit else 0
+        return (is_trump, _RANK_STRENGTH.get(rank_name(card), 0))
+
+    # Exclude protected bottom card from all selection
+    pool = [c for c in (my_cards + opp_cards + talon_cards) if c is not protected]
+    pool_sorted = sorted(pool, key=card_strength, reverse=True)
+
+    best5 = pool_sorted[:5]
+
+    # Absolute safety: ensure protected is not in best5, then refill to 5
+    best5 = [c for c in best5 if c is not protected]
+    if len(best5) < 5:
+        for c in pool_sorted:
+            if c is protected:
+                continue
+            if c not in best5:
+                best5.append(c)
+            if len(best5) == 5:
+                break
+
+    # If we already have exactly those 5 cards, do nothing
+    if set(best5) == set(my_cards):
+        return
+
+    missing = [c for c in best5 if c not in my_cards]
+    give_back = [c for c in my_cards if c not in best5]
+
+    if len(missing) != len(give_back):
+        return
+
+    for take, give in zip(missing, give_back):
+        if take in opp_cards:
+            idx = opp_cards.index(take)
+            opp_cards[idx] = give
+        elif take in talon_cards:
+            idx = talon_cards.index(take)
+            if idx == bottom_idx:
+                return  # never touch protected bottom card
+            talon_cards[idx] = give
+        else:
+            return
+
+    me.hand.cards[:] = best5
+    opp.hand.cards[:] = opp_cards
+    state.talon._cards[:] = talon_cards  # type: ignore[attr-defined]
 
 
 def _peek_full_state(perspective: PlayerPerspective) -> GameState:
@@ -276,10 +491,16 @@ class PerfectInfoBot(Bot):
             # Switch to regular phase-2 alpha-beta (no peeking)
             return self._phase2_delegate.get_move(perspective, leader_move)
         
-        # Phase 1: perfect-info search using full state peek and cheat
-        if not self._rigged_once and len(perspective.get_game_history()) == 0:
-            _rig_to_all_trumps(perspective)
-            self._rigged_once = True
+        # Only rig when WE are the leader (leader_move is None).
+        # Never mutate state after the opponent has already chosen a move.
+        if leader_move is None:
+            # First move of the game: force the opening hand exactly once
+            if not self._rigged_once and len(perspective.get_game_history()) == 0:
+                _rig_to_opening_hand(perspective)
+                self._rigged_once = True
+            else:
+                # Subsequent tricks where we are leader: upgrade hand safely
+                _rig_to_best_five(perspective)
 
         engine = _get_engine(perspective)
         state = _peek_full_state(perspective)
