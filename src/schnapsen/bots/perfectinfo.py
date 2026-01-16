@@ -467,6 +467,22 @@ def _heuristic_value(state, maximizing: bool) -> float:
     return value if maximizing else -value
 
 
+def _state_key(state: GameState) -> tuple:
+    leader_hand = tuple(sorted(state.leader.hand.cards))
+    follower_hand = tuple(sorted(state.follower.hand.cards))
+    talon = tuple(state.talon._cards) if hasattr(state.talon, "_cards") else tuple()
+
+    return (
+        leader_hand,
+        follower_hand,
+        talon,
+        state.leader.score.direct_points,
+        state.follower.score.direct_points,
+        state.leader.score.pending_points,
+        state.follower.score.pending_points,
+    )
+
+
 @dataclass(frozen=True)
 class SearchConfig:
     max_depth_phase1: int = 8
@@ -483,69 +499,135 @@ class PerfectInfoBot(Bot):
         super().__init__(name=name)
         self.config = config
         self._phase2_delegate = AlphaBetaBot(name=None)
-        # rigging control
+
+        # Rigging control
         self._rigged_once = False
 
+        # PERFORMANCE ADDITIONS
+        self._tt: dict[tuple, tuple[float, Optional[tuple]]] = {}  # transposition table
+        self._nodes: int = 0
+        self._node_budget: int = 20000  # safe default, tune as needed
+        self._scorer = SchnapsenTrickScorer()
+
+
     def get_move(self, perspective: PlayerPerspective, leader_move: Optional[Move]) -> Move:
+        # Phase 2: delegate (no cheating, already optimal)
         if perspective.get_phase() == GamePhase.TWO:
-            # Switch to regular phase-2 alpha-beta (no peeking)
             return self._phase2_delegate.get_move(perspective, leader_move)
-        
-        # Only rig when WE are the leader (leader_move is None).
-        # Never mutate state after the opponent has already chosen a move.
+
+        # ============================
+        # Phase 1: perfect-info search
+        # ============================
+
+        # Only rig when WE are leader (leader_move is None)
         if leader_move is None:
-            # First move of the game: force the opening hand exactly once
             if not self._rigged_once and len(perspective.get_game_history()) == 0:
                 _rig_to_opening_hand(perspective)
                 self._rigged_once = True
             else:
-                # Subsequent tricks where we are leader: upgrade hand safely
                 _rig_to_best_five(perspective)
 
         engine = _get_engine(perspective)
         state = _peek_full_state(perspective)
+
+        # Dynamic depth based on talon size (BIG speedup)
+        talon_len = len(getattr(state.talon, "_cards", []))
+        if talon_len > 6:
+            depth = 4
+        elif talon_len > 2:
+            depth = 6
+        else:
+            depth = self.config.max_depth_phase1
+
+        # Reset counters per move
+        self._nodes = 0
 
         _, move = self._value_phase1(
             state=state,
             engine=engine,
             leader_move=leader_move,
             maximizing=True,
-            depth=self.config.max_depth_phase1,
+            depth=depth,
             alpha=float("-inf"),
             beta=float("inf"),
         )
         return move
 
+
     def _value_phase1(
-        self,
-        state: GameState,
-        engine: GamePlayEngine,
-        leader_move: Optional[Move],
-        maximizing: bool,
-        depth: int,
-        alpha: float,
-        beta: float,
-    ) -> tuple[float, Move]:
-        # Use leader/follower perspectives to enumerate legal moves even in Phase 1
+    self,
+    state: GameState,
+    engine: GamePlayEngine,
+    leader_move: Optional[Move],
+    maximizing: bool,
+    depth: int,
+    alpha: float,
+    beta: float,
+) -> tuple[float, Move]:
+
+        # Node budget cutoff (guarantees speed)
+        self._nodes += 1
+        if self._nodes > self._node_budget:
+            # Fallback heuristic
+            dummy_persp = LeaderPerspective(state, engine)
+            moves = dummy_persp.valid_moves()
+            return _heuristic_value(state, maximizing), moves[0]
+
+        # Build perspective
         if leader_move is None:
             my_perspective: PlayerPerspective = LeaderPerspective(state, engine)
         else:
             my_perspective = FollowerPerspective(state, engine, leader_move)
 
         valid_moves = my_perspective.valid_moves()
-        # Phase 1 can include non-card leader moves (e.g., TrumpExchange).
-        # Our recursion assumes "leader plays a card, follower responds", so filter to card-playing moves.
+
+        # Leader: ignore non-card moves
         if leader_move is None:
             valid_moves = [m for m in valid_moves if hasattr(m, "card")]
 
-        assert valid_moves, "No valid moves found (unexpected)."
+        assert valid_moves, "No valid moves found"
+
+        # ============================
+        # TRANSPOSITION TABLE LOOKUP
+        # ============================
+        lm_key = None
+        if leader_move is None:
+            lm_key = ("L",)
+        elif hasattr(leader_move, "card"):
+            c = leader_move.card
+            lm_key = ("F", c.rank, c.suit)
+        else:
+            lm_key = ("F", type(leader_move).__name__)
+
+        key = (_state_key(state), lm_key, maximizing, depth)
+        if key in self._tt:
+            val, move_desc = self._tt[key]
+            if move_desc is not None:
+                for m in valid_moves:
+                    if hasattr(m, "card"):
+                        if (m.card.rank, m.card.suit) == move_desc:
+                            return val, m
+            return val, valid_moves[0]
+
+        # ============================
+        # MOVE ORDERING (huge speedup)
+        # ============================
+        trump = state.talon.trump_suit()
+        rank_score = {"ACE": 5, "TEN": 4, "KING": 3, "QUEEN": 2, "JACK": 1}
+
+        def sort_key(m: Move) -> int:
+            if not hasattr(m, "card"):
+                return -100
+            c = m.card
+            return (10 if c.suit == trump else 0) + rank_score.get(c.rank.name, 0)
+
+        valid_moves.sort(key=sort_key, reverse=maximizing)
 
         best_value = float("-inf") if maximizing else float("inf")
         best_move: Optional[Move] = None
 
         for move in valid_moves:
             if leader_move is None:
-                # choose leader move -> recurse to follower reply
                 value, _ = self._value_phase1(
                     state=state,
                     engine=engine,
@@ -556,22 +638,16 @@ class PerfectInfoBot(Bot):
                     beta=beta,
                 )
             else:
-                # choose follower move -> complete trick -> recurse to next trick
-                forced_leader = OneFixedMoveBot(leader_move)
-                forced_follower = OneFixedMoveBot(move)
+                leader = OneFixedMoveBot(leader_move)
+                follower = OneFixedMoveBot(move)
 
-                new_state = engine.play_one_trick(
-                    game_state=state,
-                    new_leader=forced_leader,
-                    new_follower=forced_follower,
-                )
+                new_state = engine.play_one_trick(state, leader, follower)
 
-                winning_info = SchnapsenTrickScorer().declare_winner(new_state)
+                winning_info = self._scorer.declare_winner(new_state)
                 if winning_info:
                     winner_impl = winning_info[0].implementation
                     points = float(winning_info[1])
-
-                    follower_wins = (winner_impl == forced_follower)
+                    follower_wins = (winner_impl == follower)
                     if not follower_wins:
                         points = -points
                     if not maximizing:
@@ -579,39 +655,41 @@ class PerfectInfoBot(Bot):
                     value = points
                 else:
                     if depth <= 1:
-                        value = _heuristic_value(new_state, maximizing) if self.config.use_heuristic else 0.0
+                        value = _heuristic_value(new_state, maximizing)
                     else:
-                        leader_stayed = (forced_leader == new_state.leader.implementation)
-                        next_maximizing = (not maximizing) if leader_stayed else maximizing
-
+                        leader_stayed = (leader == new_state.leader.implementation)
+                        next_max = (not maximizing) if leader_stayed else maximizing
                         value, _ = self._value_phase1(
-                            state=new_state,
-                            engine=engine,
-                            leader_move=None,
-                            maximizing=next_maximizing,
-                            depth=depth - 1,
-                            alpha=alpha,
-                            beta=beta,
+                            new_state, engine, None, next_max, depth - 1, alpha, beta
                         )
 
-            # alpha-beta pruning
+            # Alpha-beta pruning
             if maximizing:
                 if value > best_value:
-                    best_value = value
-                    best_move = move
+                    best_value, best_move = value, move
                 alpha = max(alpha, best_value)
                 if beta <= alpha:
                     break
             else:
                 if value < best_value:
-                    best_value = value
-                    best_move = move
+                    best_value, best_move = value, move
                 beta = min(beta, best_value)
                 if beta <= alpha:
                     break
 
         assert best_move is not None
+
+        # ============================
+        # STORE IN TRANSPOSITION TABLE
+        # ============================
+        if hasattr(best_move, "card"):
+            bm_desc = (best_move.card.rank, best_move.card.suit)
+        else:
+            bm_desc = None
+        self._tt[key] = (best_value, bm_desc)
+
         return best_value, best_move
+
 
     def notify_game_end(self, won: bool, perspective: PlayerPerspective) -> None:
         # Reset so the next game can rig again
