@@ -468,19 +468,31 @@ def _heuristic_value(state, maximizing: bool) -> float:
 
 
 def _state_key(state: GameState) -> tuple:
-    leader_hand = tuple(sorted(state.leader.hand.cards))
-    follower_hand = tuple(sorted(state.follower.hand.cards))
-    talon = tuple(state.talon._cards) if hasattr(state.talon, "_cards") else tuple()
+    def card_id(c) -> tuple:
+        # Convert to totally orderable primitives
+        suit = getattr(c.suit, "name", str(c.suit))
+        rank = getattr(c.rank, "name", str(c.rank))
+        return (suit, rank)
+
+    leader_hand = tuple(sorted(card_id(c) for c in state.leader.hand.cards))
+    follower_hand = tuple(sorted(card_id(c) for c in state.follower.hand.cards))
+
+    # Talon order matters, so DO NOT sort it
+    if hasattr(state.talon, "_cards"):
+        talon = tuple(card_id(c) for c in state.talon._cards)  # type: ignore[attr-defined]
+    else:
+        talon = tuple()
 
     return (
         leader_hand,
         follower_hand,
         talon,
-        state.leader.score.direct_points,
-        state.follower.score.direct_points,
-        state.leader.score.pending_points,
-        state.follower.score.pending_points,
+        int(getattr(state.leader.score, "direct_points", 0)),
+        int(getattr(state.follower.score, "direct_points", 0)),
+        int(getattr(state.leader.score, "pending_points", 0)),
+        int(getattr(state.follower.score, "pending_points", 0)),
     )
+
 
 
 @dataclass(frozen=True)
