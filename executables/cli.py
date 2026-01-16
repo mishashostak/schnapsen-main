@@ -64,7 +64,7 @@ def perfectinfo_vs_rdeep() -> None:
     bot2: Bot = rdeep
 
     wins = 0
-    amount = 2
+    amount = 200
 
     for game_number in range(1, amount + 1):
         # swap roles every other game
@@ -77,9 +77,150 @@ def perfectinfo_vs_rdeep() -> None:
         if winner_id == perfect:
             wins += 1
 
-        if game_number % 1 == 0:
+        if game_number % 5 == 0:
             print(f"PerfectInfo won {wins} out of {game_number} games "
                   f"(last game: winner={winner_id}, points={game_points}, score={score})")
+
+
+@main.command()
+@click.option("--games", default=200, show_default=True, type=int, help="How many games to play")
+@click.option("--seed0", default=1, show_default=True, type=int, help="First seed used for random.Random(seed)")
+@click.option("--rdeep-samples", default=16, show_default=True, type=int)
+@click.option("--rdeep-depth", default=4, show_default=True, type=int)
+@click.option("--outfile", default="loss_report.txt", show_default=True, type=str)
+def perfectinfo_diagnose(games: int, seed0: int, rdeep_samples: int, rdeep_depth: int, outfile: str) -> None:
+    """
+    Run PerfectInfoBot vs RdeepBot for many games.
+    For each LOSS, dump a compact, readable replay to a text file you can share.
+    """
+    import random
+    from typing import Optional, List, Tuple
+
+    from schnapsen.game import SchnapsenGamePlayEngine, PlayerPerspective, Move, GamePhase
+    from schnapsen.bots.rdeep import RdeepBot
+    from schnapsen.bots.perfectinfo import PerfectInfoBot  # <-- change if your module path differs
+
+    engine = SchnapsenGamePlayEngine()
+
+    # --- Logging wrapper bot ---
+    class LoggingBot:
+        """
+        Wraps a Bot and records (phase, talon_len, leader_move?, chosen_move, scores if accessible).
+        """
+        def __init__(self, inner, label: str):
+            self.inner = inner
+            self.label = label
+            self.log: List[str] = []
+
+        def get_move(self, perspective: PlayerPerspective, leader_move: Optional[Move]) -> Move:
+            # Ask inner bot
+            mv = self.inner.get_move(perspective, leader_move)
+
+            # Gather cheap state info
+            try:
+                phase = perspective.get_phase()
+            except Exception:
+                phase = "?"
+
+            try:
+                talon_len = len(getattr(perspective._PlayerPerspective__game_state.talon, "_cards", []))  # type: ignore[attr-defined]
+            except Exception:
+                talon_len = "?"
+
+            # Try to read scores (best-effort)
+            ldp = fdp = lpp = fpp = "?"
+            try:
+                st = perspective._PlayerPerspective__game_state  # type: ignore[attr-defined]
+                ldp = getattr(st.leader.score, "direct_points", "?")
+                fdp = getattr(st.follower.score, "direct_points", "?")
+                lpp = getattr(st.leader.score, "pending_points", "?")
+                fpp = getattr(st.follower.score, "pending_points", "?")
+            except Exception:
+                pass
+
+            lm_str = _move_to_str(leader_move) if leader_move is not None else "-"
+            mv_str = _move_to_str(mv)
+
+            self.log.append(
+                f"[{self.label}] phase={phase} talon={talon_len} "
+                f"score(L:{ldp}+{lpp}, F:{fdp}+{fpp}) "
+                f"leader_move={lm_str} -> move={mv_str}"
+            )
+            return mv
+
+        def notify_game_end(self, won: bool, perspective: PlayerPerspective) -> None:
+            # Forward if inner has it
+            if hasattr(self.inner, "notify_game_end"):
+                self.inner.notify_game_end(won, perspective)
+
+        def notify_trump_exchange(self, move) -> None:
+            if hasattr(self.inner, "notify_trump_exchange"):
+                self.inner.notify_trump_exchange(move)
+
+    def _move_to_str(m: Optional[Move]) -> str:
+        if m is None:
+            return "-"
+        t = type(m).__name__
+        if hasattr(m, "card"):
+            c = m.card  # type: ignore[attr-defined]
+            r = getattr(c.rank, "name", str(c.rank))
+            s = getattr(c.suit, "name", str(c.suit))
+            return f"{t}({r}_{s})"
+        # try common attrs
+        if hasattr(m, "jack"):
+            j = m.jack  # type: ignore[attr-defined]
+            r = getattr(j.rank, "name", str(j.rank))
+            s = getattr(j.suit, "name", str(j.suit))
+            return f"{t}(jack={r}_{s})"
+        return t
+
+    wins = 0
+    losses: List[Tuple[int, str]] = []
+
+    with open(outfile, "w", encoding="utf-8") as f:
+        f.write("PerfectInfoBot vs RdeepBot — LOSS DIAGNOSTICS\n\n")
+
+        for i in range(games):
+            seed = seed0 + i
+
+            # fresh bots each game (important so internal caches don't leak across games)
+            pi_inner = PerfectInfoBot(name="PerfectInfo")
+            rd_inner = RdeepBot(num_samples=rdeep_samples, depth=rdeep_depth, rand=random.Random(99991 + seed))
+
+            pi = LoggingBot(pi_inner, "PI")
+            rd = LoggingBot(rd_inner, "RD")
+
+            winner, game_points, score = engine.play_game(pi, rd, random.Random(seed))
+
+            pi_won = (winner == pi)
+            if pi_won:
+                wins += 1
+            else:
+                # record a loss report
+                header = f"\n=== LOSS seed={seed} winner={winner} points={game_points} score={score} ===\n"
+                f.write(header)
+                f.write("\n-- Move log --\n")
+                for line in pi.log:
+                    f.write(line + "\n")
+                for line in rd.log:
+                    f.write(line + "\n")
+
+                # also print it to console briefly
+                losses.append((seed, header.strip()))
+                print(f"LOSS at seed {seed}: points={game_points}, score={score}")
+
+            # progress
+            if (i + 1) % max(1, games // 10) == 0:
+                print(f"Progress {i+1}/{games} | wins={wins} | winrate={wins/(i+1):.1%}")
+
+        f.write(f"\nSUMMARY: wins={wins}/{games} ({wins/games:.1%})\n")
+        if losses:
+            f.write("\nLOSS SEEDS:\n")
+            for seed, hdr in losses:
+                f.write(f"- {seed}\n")
+
+    print(f"\nDONE. Wins={wins}/{games} ({wins/games:.1%})")
+    print(f"Wrote loss details to: {outfile}")
 
 
 @main.command()

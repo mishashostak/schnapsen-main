@@ -138,3 +138,4 @@ dmypy.json
 # ML models
 ML_models/
 ML_replay_memories/
+loss_report.txt

@@ -439,6 +439,20 @@ def _try_extract_direct_points(state: GameState) -> Optional[tuple[int, int]]:
     return None
 
 
+def _pick_forced_special_move(perspective: PlayerPerspective) -> Optional[Move]:
+    """
+    If a special move exists (TrumpExchange / Marriage), play it immediately.
+    We detect by class name to stay robust across repo versions.
+    """
+    for m in perspective.valid_moves():
+        name = type(m).__name__.lower()
+        if "trumpexchange" in name:
+            return m
+        if "marriage" in name:
+            return m
+    return None
+
+
 def _heuristic_value(state, maximizing: bool) -> float:
     leader = state.leader
     follower = state.follower
@@ -465,6 +479,61 @@ def _heuristic_value(state, maximizing: bool) -> float:
 
     value = base + trump_term + tempo_term
     return value if maximizing else -value
+
+
+def _canonicalize_move(perspective: PlayerPerspective, chosen: Move) -> Move:
+    """Return the matching Move instance from perspective.valid_moves()."""
+    legal = perspective.valid_moves()
+
+    # If it's already exactly one of the legal moves, perfect.
+    if chosen in legal:
+        return chosen
+
+    # Card move: match by (rank, suit)
+    if hasattr(chosen, "card"):
+        cr = getattr(chosen.card.rank, "name", str(chosen.card.rank))
+        cs = getattr(chosen.card.suit, "name", str(chosen.card.suit))
+        for m in legal:
+            if hasattr(m, "card"):
+                mr = getattr(m.card.rank, "name", str(m.card.rank))
+                ms = getattr(m.card.suit, "name", str(m.card.suit))
+                if (mr, ms) == (cr, cs):
+                    return m
+
+    # Special move: match by class name
+    cname = type(chosen).__name__
+    for m in legal:
+        if type(m).__name__ == cname:
+            return m
+
+    # Fallback: never return illegal
+    return legal[0]
+
+
+def _should_play_marriage(perspective: PlayerPerspective) -> bool:
+    state = perspective._PlayerPerspective__game_state  # type: ignore
+    leader = state.leader
+    follower = state.follower
+
+    # If talon still large, delay marriage
+    talon_len = len(getattr(state.talon, "_cards", []))
+    if talon_len > 2:
+        return False
+
+    # Do NOT allow opponent to exchange trump after marriage
+    for m in perspective.valid_moves():
+        if "trumpexchange" in type(m).__name__.lower():
+            return False
+
+    # Only play marriage if it immediately wins or locks Phase 2 lead
+    l_pts = leader.score.direct_points
+    f_pts = follower.score.direct_points
+    pending = getattr(leader.score, "pending_points", 0)
+
+    # Marriage must either:
+    # - win immediately
+    # - OR guarantee Phase 2 entry with lead
+    return (l_pts + pending >= 66) or (l_pts + pending > f_pts)
 
 
 def _state_key(state: GameState) -> tuple:
@@ -515,21 +584,38 @@ class PerfectInfoBot(Bot):
         # Rigging control
         self._rigged_once = False
 
+        # Marriage control (FIX 4)
+        self._marriage_played = False
+
         # PERFORMANCE ADDITIONS
-        self._tt: dict[tuple, tuple[float, Optional[tuple]]] = {}  # transposition table
-        self._nodes: int = 0
-        self._node_budget: int = 20000  # safe default, tune as needed
+        self._tt = {}
+        self._nodes = 0
+        self._node_budget = 20000
         self._scorer = SchnapsenTrickScorer()
 
 
     def get_move(self, perspective: PlayerPerspective, leader_move: Optional[Move]) -> Move:
-        # Phase 2: delegate (no cheating, already optimal)
+        # Phase 2 switches to a pure alpha-beta pruning bot.
         if perspective.get_phase() == GamePhase.TWO:
             return self._phase2_delegate.get_move(perspective, leader_move)
 
-        # ============================
-        # Phase 1: perfect-info search
-        # ============================
+        # If the leader_move is something like TrumpExchange (no .card),
+        # do not run our "leader-card/follower-card" search. Just play a legal move.
+        if leader_move is not None and not hasattr(leader_move, "card"):
+            return perspective.valid_moves()[0]
+
+        # Special move potential
+        special = _pick_forced_special_move(perspective)
+        if special is not None:
+            # Prevent multiple marriages in Phase 1
+            if "marriage" in type(special).__name__.lower():
+                if self._marriage_played:
+                    special = None
+                else:
+                    self._marriage_played = True
+
+            if special is not None:
+                return special
 
         # Only rig when WE are leader (leader_move is None)
         if leader_move is None:
@@ -542,28 +628,33 @@ class PerfectInfoBot(Bot):
         engine = _get_engine(perspective)
         state = _peek_full_state(perspective)
 
-        # Dynamic depth based on talon size (BIG speedup)
-        talon_len = len(getattr(state.talon, "_cards", []))
-        if talon_len > 6:
-            depth = 4
-        elif talon_len > 2:
-            depth = 6
-        else:
-            depth = self.config.max_depth_phase1
+        # Iterative deepening: best move from deepest completed search
+        best_move: Optional[Move] = None
+        best_val: float = float("-inf")
 
-        # Reset counters per move
+        # Reset counters and (optionally) TT per move for stability
         self._nodes = 0
 
-        _, move = self._value_phase1(
-            state=state,
-            engine=engine,
-            leader_move=leader_move,
-            maximizing=True,
-            depth=depth,
-            alpha=float("-inf"),
-            beta=float("inf"),
-        )
-        return move
+        for d in range(2, self.config.max_depth_phase1 + 1):
+            val, mv = self._value_phase1(
+                state=state,
+                engine=engine,
+                leader_move=leader_move,
+                maximizing=True,
+                depth=d,
+                alpha=float("-inf"),
+                beta=float("inf"),
+            )
+            best_move = mv
+            best_val = val
+
+
+            # If we completely solved to terminal (you can add a stronger condition later),
+            # break early. Otherwise keep deepening until max_depth.
+            # (Leave as-is for now.)
+
+        assert best_move is not None
+        return _canonicalize_move(perspective, best_move)
 
 
     def _value_phase1(
@@ -607,7 +698,11 @@ class PerfectInfoBot(Bot):
             lm_key = ("L",)
         elif hasattr(leader_move, "card"):
             c = leader_move.card
-            lm_key = ("F", c.rank, c.suit)
+            lm_key = (
+                "F",
+                getattr(c.rank, "name", str(c.rank)),
+                getattr(c.suit, "name", str(c.suit)),
+            )
         else:
             lm_key = ("F", type(leader_move).__name__)
 
@@ -617,9 +712,12 @@ class PerfectInfoBot(Bot):
             if move_desc is not None:
                 for m in valid_moves:
                     if hasattr(m, "card"):
-                        if (m.card.rank, m.card.suit) == move_desc:
+                        mr = getattr(m.card.rank, "name", str(m.card.rank))
+                        ms = getattr(m.card.suit, "name", str(m.card.suit))
+                        if (mr, ms) == move_desc:
                             return val, m
             return val, valid_moves[0]
+
 
         # ============================
         # MOVE ORDERING (huge speedup)
@@ -631,7 +729,9 @@ class PerfectInfoBot(Bot):
             if not hasattr(m, "card"):
                 return -100
             c = m.card
-            return (10 if c.suit == trump else 0) + rank_score.get(c.rank.name, 0)
+            rname = getattr(c.rank, "name", str(c.rank))
+            return (10 if c.suit == trump else 0) + rank_score.get(rname, 0)
+
 
         valid_moves.sort(key=sort_key, reverse=maximizing)
 
@@ -675,6 +775,13 @@ class PerfectInfoBot(Bot):
                             new_state, engine, None, next_max, depth - 1, alpha, beta
                         )
 
+            # Phase-2 entry penalty
+            if len(getattr(state.talon, "_cards", [])) == 0:
+                leader_pts = state.leader.score.direct_points
+                follower_pts = state.follower.score.direct_points
+                if leader_pts < follower_pts:
+                    value -= 25
+
             # Alpha-beta pruning
             if maximizing:
                 if value > best_value:
@@ -695,7 +802,9 @@ class PerfectInfoBot(Bot):
         # STORE IN TRANSPOSITION TABLE
         # ============================
         if hasattr(best_move, "card"):
-            bm_desc = (best_move.card.rank, best_move.card.suit)
+            br = getattr(best_move.card.rank, "name", str(best_move.card.rank))
+            bs = getattr(best_move.card.suit, "name", str(best_move.card.suit))
+            bm_desc = (br, bs)
         else:
             bm_desc = None
         self._tt[key] = (best_value, bm_desc)
@@ -704,5 +813,6 @@ class PerfectInfoBot(Bot):
 
 
     def notify_game_end(self, won: bool, perspective: PlayerPerspective) -> None:
-        # Reset so the next game can rig again
         self._rigged_once = False
+        self._marriage_played = False
+
