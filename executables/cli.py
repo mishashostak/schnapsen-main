@@ -1,7 +1,7 @@
 import random
 import pathlib
 
-from typing import Optional
+from typing import Optional, List, Tuple
 
 import click
 from schnapsen.alternative_engines.ace_one_engine import AceOneGamePlayEngine
@@ -93,12 +93,6 @@ def perfectinfo_diagnose(games: int, seed0: int, rdeep_samples: int, rdeep_depth
     Run PerfectInfoBot vs RdeepBot for many games.
     For each LOSS, dump a compact, readable replay to a text file you can share.
     """
-    import random
-    from typing import Optional, List, Tuple
-
-    from schnapsen.game import SchnapsenGamePlayEngine, PlayerPerspective, Move, GamePhase
-    from schnapsen.bots.rdeep import RdeepBot
-    from schnapsen.bots.perfectinfo import PerfectInfoBot  # <-- change if your module path differs
 
     engine = SchnapsenGamePlayEngine()
 

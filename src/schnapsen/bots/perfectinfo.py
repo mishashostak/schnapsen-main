@@ -604,18 +604,27 @@ class PerfectInfoBot(Bot):
         if leader_move is not None and not hasattr(leader_move, "card"):
             return perspective.valid_moves()[0]
 
-        # Special move potential
+
+        # Special moves: DO NOT autoplay them.
+        # Only allow Marriage under strict conditions; never force TrumpExchange.
         special = _pick_forced_special_move(perspective)
         if special is not None:
-            # Prevent multiple marriages in Phase 1
-            if "marriage" in type(special).__name__.lower():
-                if self._marriage_played:
+            sname = type(special).__name__.lower()
+
+            # Never auto-play trump exchange in this rigged setup (it creates timing windows for RD)
+            if "trumpexchange" in sname:
+                special = None
+
+            # Only play Marriage when it's actually correct to cash it
+            elif "marriage" in sname:
+                if self._marriage_played or (not _should_play_marriage(perspective)):
                     special = None
                 else:
                     self._marriage_played = True
 
             if special is not None:
-                return special
+                return _canonicalize_move(perspective, special)
+
 
         # Only rig when WE are leader (leader_move is None)
         if leader_move is None:
