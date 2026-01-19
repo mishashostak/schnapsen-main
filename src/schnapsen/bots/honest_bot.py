@@ -149,47 +149,76 @@ class OneFixedMoveBot(Bot):
         assert self._move is not None, "This bot can only play one move, after that it ends"
 
         # Consume it (one-shot bot)
+        move_to_play = self._move
         self._move = None
 
-        # Choose a legal move from this *current* perspective that matches our descriptor
         candidates = perspective.valid_moves()
 
-        # First: strict match by class + card identity by (rank,suit)
+        # -------------------------
+        # Case 1: Card-based move
+        # -------------------------
         if self._has_card:
+            # strict: same class + same card (rank,suit)
             for m in candidates:
                 if m.__class__ is self._cls and hasattr(m, "card"):
                     mc = m.card  # type: ignore[attr-defined]
                     if mc.rank == self._rank and mc.suit == self._suit:
                         return m
 
-            # Second: looser match: any move with same card (rank,suit), regardless of class
+            # looser: any move with same card (rank,suit)
             for m in candidates:
                 if hasattr(m, "card"):
                     mc = m.card  # type: ignore[attr-defined]
                     if mc.rank == self._rank and mc.suit == self._suit:
                         return m
 
-        # If we get here, we couldn't match it. Fallback to a legal move
-        # rather than crashing the search engine.
+            return candidates[0]
+
+        # -------------------------
+        # Case 2: Non-card move (Marriage / TrumpExchange / etc.)
+        # -------------------------
+        # Best effort: match by class name first
+        for m in candidates:
+            if m.__class__ is self._cls:
+                return m
+
+        # If the move has a "jack" attribute (common for TrumpExchange), match by that too
+        if hasattr(move_to_play, "jack"):
+            j = move_to_play.jack  # type: ignore[attr-defined]
+            jr = getattr(j.rank, "name", str(j.rank))
+            js = getattr(j.suit, "name", str(j.suit))
+            for m in candidates:
+                if hasattr(m, "jack"):
+                    mj = m.jack  # type: ignore[attr-defined]
+                    mjr = getattr(mj.rank, "name", str(mj.rank))
+                    mjs = getattr(mj.suit, "name", str(mj.suit))
+                    if (mjr, mjs) == (jr, js):
+                        return m
+                    
         return candidates[0]
 
 
 # =============================================================================
 # Phase-1: PERFECT-INFO AlphaBeta (cheats by peeking full GameState)
 # =============================================================================
-def _rig_to_opening_hand(perspective: PlayerPerspective) -> None:
+def _rig_to_opening_hand_safe(perspective: PlayerPerspective, leader_move: Optional[Move]) -> None:
     """
-    Research rig (Phase 1, at game start only):
+    Safe opening rig for BOTH leader and follower:
 
-    - Ensure the trump Jack is the face-up trump card at the bottom of the talon (talon_cards[-1]).
-      Never modify talon_cards[-1] after that.
-    - Force our hand to: A♠(trump), 10♠(trump), K♠(trump), Q♠(trump) + one Ace (prefer non-trump Ace).
-    - Maintain invariants via 1-for-1 swaps only.
+    - First: ensure TRUMP JACK is at bottom of talon (if safely possible) and protect talon[-1] forever.
+    - Then: force OUR hand to:
+        A(trump), 10(trump), K(trump), Q(trump) + one ACE (prefer non-trump Ace).
+    - Uses only 1-for-1 swaps.
+    - Never touches protected bottom talon card.
+    - If follower and leader_move has .card, that leader card is LOCKED and never moved/replaced.
     """
     state: GameState = perspective._PlayerPerspective__game_state  # type: ignore[attr-defined]
+
+    # Step 0: enforce trump jack at bottom (safe)
+    _ensure_trump_jack_bottom_safe(perspective, leader_move)
+
     trump_suit = state.talon.trump_suit()
 
-    # Identify which BotState is "me" vs "opponent"
     if perspective.am_i_leader():
         me = state.leader
         opp = state.follower
@@ -200,56 +229,38 @@ def _rig_to_opening_hand(perspective: PlayerPerspective) -> None:
     my_cards: List[Any] = list(me.hand.cards)
     opp_cards: List[Any] = list(opp.hand.cards)
     talon_cards: List[Any] = list(getattr(state.talon, "_cards", []))
-
     if not talon_cards:
-        return  # shouldn't happen in phase 1
+        return
+
+    bottom_idx = len(talon_cards) - 1
+    protected = talon_cards[bottom_idx]  # must be the trump jack if it was safely enforceable
+
+    def _name(x: Any) -> str:
+        return getattr(x, "name", str(x))
+
+    def card_key(c: Any) -> tuple[str, str]:
+        return (_name(getattr(c, "rank", None)), _name(getattr(c, "suit", None)))
 
     def rank_name(c: Any) -> str:
-        r = getattr(c, "rank", None)
-        return getattr(r, "name", str(r))
+        return _name(getattr(c, "rank", None))
 
     def is_trump(c: Any) -> bool:
         return getattr(c, "suit", None) == trump_suit
 
-    # ----------------------------
-    # Step 1: Move trump Jack to talon bottom and protect it
-    # ----------------------------
-    trump_jack = None
-    # find trump jack in the whole pool
-    for c in my_cards + opp_cards + talon_cards:
-        if is_trump(c) and rank_name(c) == "JACK":
-            trump_jack = c
-            break
-    if trump_jack is None:
-        return  # unexpected, but don't corrupt state
+    # Locked leader card key (rank,suit)
+    locked_key: Optional[tuple[str, str]] = None
+    if leader_move is not None and hasattr(leader_move, "card"):
+        lc = leader_move.card  # type: ignore[attr-defined]
+        locked_key = card_key(lc)
 
-    bottom_idx = len(talon_cards) - 1
-    bottom_card = talon_cards[bottom_idx]
-
-    if trump_jack is not bottom_card:
-        # Put trump_jack at bottom, swap the displaced bottom_card back to where jack came from
-        if trump_jack in talon_cards:
-            j_idx = talon_cards.index(trump_jack)
-            # swap within talon (safe because bottom_card is trump suit already)
-            talon_cards[j_idx], talon_cards[bottom_idx] = talon_cards[bottom_idx], talon_cards[j_idx]
-        elif trump_jack in my_cards:
-            j_idx = my_cards.index(trump_jack)
-            my_cards[j_idx] = bottom_card
-            talon_cards[bottom_idx] = trump_jack
-        elif trump_jack in opp_cards:
-            j_idx = opp_cards.index(trump_jack)
-            opp_cards[j_idx] = bottom_card
-            talon_cards[bottom_idx] = trump_jack
-        else:
-            return
-
-    protected = talon_cards[bottom_idx]  # this is now the trump jack
-    # Never touch talon_cards[bottom_idx] again.
-
-    # ----------------------------
-    # Step 2: Build desired opening hand
-    # ----------------------------
-    pool = [c for c in (my_cards + opp_cards + talon_cards) if c is not protected]
+    # Pool excludes protected bottom and excludes locked leader card (if any)
+    pool: List[Any] = []
+    for c in (my_cards + opp_cards + talon_cards):
+        if c is protected:
+            continue
+        if locked_key is not None and card_key(c) == locked_key:
+            continue
+        pool.append(c)
 
     def find_card(pred) -> Optional[Any]:
         for c in pool:
@@ -261,78 +272,71 @@ def _rig_to_opening_hand(perspective: PlayerPerspective) -> None:
     trump_ten = find_card(lambda c: is_trump(c) and rank_name(c) == "TEN")
     trump_king = find_card(lambda c: is_trump(c) and rank_name(c) == "KING")
     trump_queen = find_card(lambda c: is_trump(c) and rank_name(c) == "QUEEN")
-
     if None in (trump_ace, trump_ten, trump_king, trump_queen):
-        return  # don't partially rig if something is weird
+        return
 
-    # 5th card: an Ace, preferably non-trump
     non_trump_ace = find_card(lambda c: (not is_trump(c)) and rank_name(c) == "ACE")
-    any_extra_ace = find_card(lambda c: rank_name(c) == "ACE" and c not in {trump_ace, trump_ten, trump_king, trump_queen})
-    fifth = non_trump_ace or any_extra_ace
+    any_other_ace = find_card(
+        lambda c: rank_name(c) == "ACE" and c not in {trump_ace, trump_ten, trump_king, trump_queen}
+    )
+    fifth = non_trump_ace or any_other_ace
     if fifth is None:
         return
 
     desired = [trump_ace, trump_ten, trump_king, trump_queen, fifth]
 
-    # If we already have exactly these 5 cards, just write back any prior swaps and exit
     if set(desired) == set(my_cards):
+        # still write back in case helper changed lists
         me.hand.cards[:] = my_cards
         opp.hand.cards[:] = opp_cards
         state.talon._cards[:] = talon_cards  # type: ignore[attr-defined]
         return
 
-    # ----------------------------
-    # Step 3: 1-for-1 swap to make our hand exactly "desired"
-    # ----------------------------
     missing = [c for c in desired if c not in my_cards]
     give_back = [c for c in my_cards if c not in desired]
-
     if len(missing) != len(give_back):
-        return  # safety: avoid breaking invariants
+        return
 
     for take, give in zip(missing, give_back):
+        # guard rails
+        if take is protected:
+            return
+        if locked_key is not None and card_key(take) == locked_key:
+            return
+        if locked_key is not None and card_key(give) == locked_key:
+            return
+
         if take in opp_cards:
             idx = opp_cards.index(take)
+            if locked_key is not None and card_key(opp_cards[idx]) == locked_key:
+                return
             opp_cards[idx] = give
+
         elif take in talon_cards:
             idx = talon_cards.index(take)
-            # NEVER touch the protected bottom card
             if idx == bottom_idx:
                 return
             talon_cards[idx] = give
+
         else:
             return
 
-    # Set our hand to the exact desired cards
-    my_cards = desired
-
-    # ----------------------------
-    # Step 4: Write back mutated lists (preserve invariants)
-    # ----------------------------
-    me.hand.cards[:] = my_cards
+    # Write back
+    me.hand.cards[:] = desired
     opp.hand.cards[:] = opp_cards
     state.talon._cards[:] = talon_cards  # type: ignore[attr-defined]
 
 
-# --- Card ordering: trump dominates, then rank strength (A > 10 > K > Q > J) ---
-_RANK_STRENGTH = {
-    "ACE": 5,
-    "TEN": 4,
-    "KING": 3,
-    "QUEEN": 2,
-    "JACK": 1,
-}
+def _rig_to_best_five_safe(perspective: PlayerPerspective, leader_move: Optional[Move]) -> None:
+    """
+    Unified best-5 rig for BOTH leader and follower turns.
 
-def _rank_name(card: Any) -> str:
-    r = getattr(card, "rank", None)
-    return getattr(r, "name", str(r))
-
-def _card_strength(card: Any, trump_suit: Any) -> tuple[int, int]:
-    """Sort key: (is_trump, rank_strength). Higher is better."""
-    is_trump = 1 if getattr(card, "suit", None) == trump_suit else 0
-    return (is_trump, _RANK_STRENGTH.get(_rank_name(card), 0))
-
-def _rig_to_best_five(perspective: PlayerPerspective) -> None:
+    - Ensures trump JACK is at talon bottom if safely possible.
+    - Protects talon[-1] forever (never modified after).
+    - If follower and leader_move has .card, locks that leader card (cannot be moved/replaced).
+    - Chooses best 5 by strength: trump first, then A > 10 > K > Q > J.
+    - Uses only 1-for-1 swaps.
+    """
     state: GameState = perspective._PlayerPerspective__game_state  # type: ignore[attr-defined]
     trump_suit = state.talon.trump_suit()
 
@@ -346,62 +350,183 @@ def _rig_to_best_five(perspective: PlayerPerspective) -> None:
     my_cards: List[Any] = list(me.hand.cards)
     opp_cards: List[Any] = list(opp.hand.cards)
     talon_cards: List[Any] = list(getattr(state.talon, "_cards", []))
-
     if not talon_cards:
         return
-    protected = talon_cards[-1]               # face-up trump card (your trump jack)
+
     bottom_idx = len(talon_cards) - 1
+    protected = talon_cards[bottom_idx]  # should be trump jack if enforceable
 
-    def rank_name(card: Any) -> str:
-        r = getattr(card, "rank", None)
-        return getattr(r, "name", str(r))
+    def _name(x: Any) -> str:
+        return getattr(x, "name", str(x))
 
-    _RANK_STRENGTH = {"ACE": 5, "TEN": 4, "KING": 3, "QUEEN": 2, "JACK": 1}
+    def card_key(c: Any) -> tuple[str, str]:
+        return (_name(getattr(c, "rank", None)), _name(getattr(c, "suit", None)))
 
-    def card_strength(card: Any) -> tuple[int, int]:
-        is_trump = 1 if getattr(card, "suit", None) == trump_suit else 0
-        return (is_trump, _RANK_STRENGTH.get(rank_name(card), 0))
+    locked_key: Optional[tuple[str, str]] = None
+    if leader_move is not None and hasattr(leader_move, "card"):
+        lc = leader_move.card  # type: ignore[attr-defined]
+        locked_key = card_key(lc)
 
-    # Exclude protected bottom card from all selection
-    pool = [c for c in (my_cards + opp_cards + talon_cards) if c is not protected]
-    pool_sorted = sorted(pool, key=card_strength, reverse=True)
+    rank_strength = {"ACE": 5, "TEN": 4, "KING": 3, "QUEEN": 2, "JACK": 1}
 
+    def strength(c: Any) -> tuple[int, int]:
+        is_trump = 1 if getattr(c, "suit", None) == trump_suit else 0
+        rname = _name(getattr(c, "rank", None))
+        return (is_trump, rank_strength.get(rname, 0))
+
+    # Pool excludes protected + locked
+    pool: List[Any] = []
+    for c in (my_cards + opp_cards + talon_cards):
+        if c is protected:
+            continue
+        if locked_key is not None and card_key(c) == locked_key:
+            continue
+        pool.append(c)
+
+    if len(pool) < 5:
+        return
+
+    pool_sorted = sorted(pool, key=strength, reverse=True)
     best5 = pool_sorted[:5]
 
-    # Absolute safety: ensure protected is not in best5, then refill to 5
-    best5 = [c for c in best5 if c is not protected]
+    # hard safety filter + refill
+    best5 = [c for c in best5 if (c is not protected) and (locked_key is None or card_key(c) != locked_key)]
     if len(best5) < 5:
         for c in pool_sorted:
             if c is protected:
+                continue
+            if locked_key is not None and card_key(c) == locked_key:
                 continue
             if c not in best5:
                 best5.append(c)
             if len(best5) == 5:
                 break
+    if len(best5) != 5:
+        return
 
-    # If we already have exactly those 5 cards, do nothing
     if set(best5) == set(my_cards):
         return
 
     missing = [c for c in best5 if c not in my_cards]
     give_back = [c for c in my_cards if c not in best5]
-
     if len(missing) != len(give_back):
         return
 
     for take, give in zip(missing, give_back):
+        if take is protected:
+            return
+        if locked_key is not None and card_key(take) == locked_key:
+            return
+        if locked_key is not None and card_key(give) == locked_key:
+            return
+
         if take in opp_cards:
             idx = opp_cards.index(take)
+            if locked_key is not None and card_key(opp_cards[idx]) == locked_key:
+                return
             opp_cards[idx] = give
+
         elif take in talon_cards:
             idx = talon_cards.index(take)
             if idx == bottom_idx:
-                return  # never touch protected bottom card
+                return
             talon_cards[idx] = give
+
         else:
             return
 
     me.hand.cards[:] = best5
+    opp.hand.cards[:] = opp_cards
+    state.talon._cards[:] = talon_cards  # type: ignore[attr-defined]
+
+
+def _ensure_trump_jack_bottom_safe(perspective: PlayerPerspective, leader_move: Optional[Move]) -> None:
+    """
+    Try to ensure the TRUMP JACK is at the bottom of the talon (talon_cards[-1]) via 1-for-1 swaps.
+
+    SAFETY:
+    - If follower and leader_move has a card, that card is LOCKED and must stay in leader hand.
+    - Never swap with/move the locked card.
+    - After this runs, talon bottom is treated as protected by the other rig functions.
+
+    If the locked leader card IS the trump jack, we cannot safely move it -> do nothing.
+    """
+    state: GameState = perspective._PlayerPerspective__game_state  # type: ignore[attr-defined]
+    trump_suit = state.talon.trump_suit()
+
+    if perspective.am_i_leader():
+        me = state.leader
+        opp = state.follower
+    else:
+        me = state.follower
+        opp = state.leader
+
+    my_cards: List[Any] = list(me.hand.cards)
+    opp_cards: List[Any] = list(opp.hand.cards)
+    talon_cards: List[Any] = list(getattr(state.talon, "_cards", []))
+    if not talon_cards:
+        return
+
+    bottom_idx = len(talon_cards) - 1
+
+    def _name(x: Any) -> str:
+        return getattr(x, "name", str(x))
+
+    def rank_name(c: Any) -> str:
+        return _name(getattr(c, "rank", None))
+
+    def suit_name(c: Any) -> str:
+        return _name(getattr(c, "suit", None))
+
+    def is_trump(c: Any) -> bool:
+        return getattr(c, "suit", None) == trump_suit
+
+    # locked leader card key (rank,suit) if follower
+    locked_key: Optional[tuple[str, str]] = None
+    if leader_move is not None and hasattr(leader_move, "card"):
+        lc = leader_move.card  # type: ignore[attr-defined]
+        locked_key = (_name(lc.rank), _name(lc.suit))
+
+    # Find a trump jack we are allowed to move (i.e., not locked)
+    trump_jack = None
+    for c in (my_cards + opp_cards + talon_cards):
+        if not (is_trump(c) and rank_name(c) == "JACK"):
+            continue
+        if locked_key is not None and (_name(getattr(c, "rank", None)), _name(getattr(c, "suit", None))) == locked_key:
+            # this jack is locked as leader's committed card -> cannot move
+            continue
+        trump_jack = c
+        break
+
+    if trump_jack is None:
+        return  # can't find movable trump jack safely
+
+    # If already at bottom, done
+    if talon_cards[bottom_idx] is trump_jack:
+        # write-back in case we made list copies
+        state.talon._cards[:] = talon_cards  # type: ignore[attr-defined]
+        return
+
+    bottom_card = talon_cards[bottom_idx]
+
+    # Move trump_jack to bottom by 1-for-1 swap
+    if trump_jack in talon_cards:
+        j_idx = talon_cards.index(trump_jack)
+        talon_cards[j_idx], talon_cards[bottom_idx] = talon_cards[bottom_idx], talon_cards[j_idx]
+
+    elif trump_jack in my_cards:
+        j_idx = my_cards.index(trump_jack)
+        my_cards[j_idx] = bottom_card
+        talon_cards[bottom_idx] = trump_jack
+
+    elif trump_jack in opp_cards:
+        # allowed only if not locked (we excluded locked above)
+        j_idx = opp_cards.index(trump_jack)
+        opp_cards[j_idx] = bottom_card
+        talon_cards[bottom_idx] = trump_jack
+
+    # Write back
+    me.hand.cards[:] = my_cards
     opp.hand.cards[:] = opp_cards
     state.talon._cards[:] = talon_cards  # type: ignore[attr-defined]
 
@@ -457,7 +582,7 @@ def _heuristic_value(state, maximizing: bool) -> float:
     leader = state.leader
     follower = state.follower
 
-    # 1) Score (direct + discounted pending)
+    # 1 Score (direct + discounted pending)
     pts = _try_extract_direct_points(state)
     if pts is None:
         base = 0.0
@@ -468,13 +593,13 @@ def _heuristic_value(state, maximizing: bool) -> float:
         f_pp = getattr(follower.score, "pending_points", 0)
         base = (l_dp - f_dp) + 0.5 * (l_pp - f_pp)
 
-    # 2) Trump count advantage
+    # 2 Trump count advantage
     trump = state.talon.trump_suit()
     leader_trumps = sum(1 for c in leader.hand.cards if c.suit == trump)
     follower_trumps = sum(1 for c in follower.hand.cards if c.suit == trump)
     trump_term = 1.0 * (leader_trumps - follower_trumps)
 
-    # 3) Tempo (being leader is good)
+    # 3 Tempo (being leader is good)
     tempo_term = 0.5
 
     value = base + trump_term + tempo_term
@@ -570,7 +695,7 @@ class SearchConfig:
     use_heuristic: bool = True
 
 
-class PerfectInfoBot(Bot):
+class HonestBot(Bot):
     """
     Phase 1: perfect-info alpha-beta (cheats by peeking the full GameState)
     Phase 2: *regular* alpha-beta (no cheating), using the standard AlphaBetaBot logic
@@ -584,7 +709,7 @@ class PerfectInfoBot(Bot):
         # Rigging control
         self._rigged_once = False
 
-        # Marriage control (FIX 4)
+        # Marriage control
         self._marriage_played = False
 
         # PERFORMANCE ADDITIONS
@@ -595,27 +720,52 @@ class PerfectInfoBot(Bot):
 
 
     def get_move(self, perspective: PlayerPerspective, leader_move: Optional[Move]) -> Move:
-        # Phase 2 switches to a pure alpha-beta pruning bot.
+        # -------------------------
+        # Phase 2: no cheating
+        # -------------------------
         if perspective.get_phase() == GamePhase.TWO:
             return self._phase2_delegate.get_move(perspective, leader_move)
 
-        # If the leader_move is something like TrumpExchange (no .card),
-        # do not run our "leader-card/follower-card" search. Just play a legal move.
+        # -------------------------
+        # Phase 1: RIG FIRST THING (exactly once at game start)
+        # -------------------------
+        if (not self._rigged_once) and (len(perspective.get_game_history()) == 0):
+            _rig_to_opening_hand_safe(perspective, leader_move)
+            self._rigged_once = True
+
+        # -------------------------
+        # If leader played a special (no .card), return the best legal move.
+        # -------------------------
         if leader_move is not None and not hasattr(leader_move, "card"):
-            return perspective.valid_moves()[0]
+            # Now that OneFixedMoveBot can replay specials, we can search properly.
+            engine = _get_engine(perspective)
+            state = _peek_full_state(perspective)
 
+            self._nodes = 0
+            d = min(4, self.config.max_depth_phase1)  # small depth is usually enough here
+            val, mv = self._value_phase1(
+                state=state,
+                engine=engine,
+                leader_move=leader_move,   # follower perspective
+                maximizing=True,
+                depth=d,
+                alpha=float("-inf"),
+                beta=float("inf"),
+            )
+            return _canonicalize_move(perspective, mv)
 
-        # Special moves: DO NOT autoplay them.
-        # Only allow Marriage under strict conditions; never force TrumpExchange.
+        # -------------------------
+        # Special moves (Phase 1):
+        # - Never auto-play TrumpExchange in your rigged setup
+        # - Marriage only when your strict gate says so
+        # -------------------------
         special = _pick_forced_special_move(perspective)
         if special is not None:
             sname = type(special).__name__.lower()
 
-            # Never auto-play trump exchange in this rigged setup (it creates timing windows for RD)
             if "trumpexchange" in sname:
                 special = None
 
-            # Only play Marriage when it's actually correct to cash it
             elif "marriage" in sname:
                 if self._marriage_played or (not _should_play_marriage(perspective)):
                     special = None
@@ -625,23 +775,16 @@ class PerfectInfoBot(Bot):
             if special is not None:
                 return _canonicalize_move(perspective, special)
 
+        # Keep best-5 each time it's our turn.
+        _rig_to_best_five_safe(perspective, leader_move)
 
-        # Only rig when WE are leader (leader_move is None)
-        if leader_move is None:
-            if not self._rigged_once and len(perspective.get_game_history()) == 0:
-                _rig_to_opening_hand(perspective)
-                self._rigged_once = True
-            else:
-                _rig_to_best_five(perspective)
-
+        # -------------------------
+        # Perfect-info alpha-beta search
+        # -------------------------
         engine = _get_engine(perspective)
         state = _peek_full_state(perspective)
 
-        # Iterative deepening: best move from deepest completed search
         best_move: Optional[Move] = None
-        best_val: float = float("-inf")
-
-        # Reset counters and (optionally) TT per move for stability
         self._nodes = 0
 
         for d in range(2, self.config.max_depth_phase1 + 1):
@@ -655,12 +798,6 @@ class PerfectInfoBot(Bot):
                 beta=float("inf"),
             )
             best_move = mv
-            best_val = val
-
-
-            # If we completely solved to terminal (you can add a stronger condition later),
-            # break early. Otherwise keep deepening until max_depth.
-            # (Leave as-is for now.)
 
         assert best_move is not None
         return _canonicalize_move(perspective, best_move)
