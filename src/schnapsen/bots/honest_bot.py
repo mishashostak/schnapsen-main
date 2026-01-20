@@ -853,62 +853,41 @@ class HonestBot(Bot):
         # and should be "best available", not random.
         # -------------------------
         self._nodes += 1
-        if self._nodes > self._node_budget:
-            # Budget cutoff: pick best LEGAL move using a cheap 1-trick lookahead.
-            # This avoids "all moves look identical" on leader turns.
+        if self._nodes > self._node_budget or depth <= 0:
+            # Order moves first
+            trump = state.talon.trump_suit()
+            rank_score = {"ACE": 5, "TEN": 4, "KING": 3, "QUEEN": 2, "JACK": 1}
 
-            def eval_after_trick(ls: GameState, maxing: bool) -> float:
-                win_info = self._scorer.declare_winner(ls)
-                if win_info:
-                    winner_impl = win_info[0].implementation
-                    points = float(win_info[1])
+            def move_sort(m: Move) -> int:
+                if not hasattr(m, "card"):
+                    return -100
+                c = m.card
+                rname = getattr(c.rank, "name", str(c.rank))
+                return (10 if c.suit == trump else 0) + rank_score.get(rname, 0)
 
-                    # winner_impl is either new_state.leader.implementation or follower.implementation
-                    # We score from the perspective of "maximizing player" at THIS node.
-                    # When leader_move is not None we're at follower node, so follower_bot corresponds.
-                    return points if maxing else -points
-                return _heuristic_value(ls, maxing)
+            valid_moves.sort(key=move_sort, reverse=maximizing)
 
+            # Evaluate each move cheaply but meaningfully
             best_m = valid_moves[0]
             best_v = float("-inf") if maximizing else float("inf")
 
-            # Leader node: test each leader move against the BEST opponent response (minimax over replies)
-            if leader_move is None:
-                for m in valid_moves:
-                    # Opponent will respond as follower with a legal move.
-                    # Build a follower perspective for the same state using leader move m.
-                    opp_p = FollowerPerspective(state, engine, m)
-                    opp_moves = opp_p.valid_moves()
-                    if not opp_moves:
-                        v = _heuristic_value(state, maximizing)
-                    else:
-                        # opponent chooses best for themselves => worst for us
-                        worst_for_us = float("inf")
-                        for fm in opp_moves:
-                            leader_bot = OneFixedMoveBot(m)
-                            follower_bot = OneFixedMoveBot(fm)
-                            ns = engine.play_one_trick(state, leader_bot, follower_bot)
-                            v_ns = eval_after_trick(ns, maximizing)
-                            if v_ns < worst_for_us:
-                                worst_for_us = v_ns
-                        v = worst_for_us
-
-                    if maximizing:
-                        if v > best_v:
-                            best_v, best_m = v, m
-                    else:
-                        if v < best_v:
-                            best_v, best_m = v, m
-
-                return best_v, best_m
-
-            # Follower node: just complete the trick for each reply and score it
-            else:
+            if leader_move is not None:
+                # We are follower: complete trick and evaluate new_state
                 for m in valid_moves:
                     leader_bot = OneFixedMoveBot(leader_move)
                     follower_bot = OneFixedMoveBot(m)
-                    ns = engine.play_one_trick(state, leader_bot, follower_bot)
-                    v = eval_after_trick(ns, maximizing)
+                    new_state = engine.play_one_trick(state, leader_bot, follower_bot)
+
+                    win_info = self._scorer.declare_winner(new_state)
+                    if win_info:
+                        winner_impl = win_info[0].implementation
+                        points = float(win_info[1])
+                        follower_wins = (winner_impl == follower_bot)
+                        if not follower_wins:
+                            points = -points
+                        v = points if maximizing else -points
+                    else:
+                        v = _heuristic_value(new_state, maximizing)
 
                     if maximizing:
                         if v > best_v:
@@ -918,6 +897,41 @@ class HonestBot(Bot):
                             best_v, best_m = v, m
 
                 return best_v, best_m
+
+            else:
+                # We are leader: approximate worst-case follower reply (1-ply)
+                for m in valid_moves:
+                    # follower perspective after we lead with m
+                    foll_p = FollowerPerspective(state, engine, m)
+                    replies = foll_p.valid_moves()
+
+                    # choose a "worst reply for us" by heuristic after completing trick
+                    worst_reply = replies[0]
+                    worst_val = float("inf")
+
+                    for r in replies:
+                        leader_bot = OneFixedMoveBot(m)
+                        follower_bot = OneFixedMoveBot(r)
+                        new_state = engine.play_one_trick(state, leader_bot, follower_bot)
+
+                        # from our (leader) standpoint, higher is better
+                        v = _heuristic_value(new_state, maximizing=True)
+                        if v < worst_val:
+                            worst_val = v
+                            worst_reply = r
+
+                    # value of choosing m is the worst-case reply outcome
+                    v = worst_val if maximizing else -worst_val
+
+                    if maximizing:
+                        if v > best_v:
+                            best_v, best_m = v, m
+                    else:
+                        if v < best_v:
+                            best_v, best_m = v, m
+
+                return best_v, best_m
+
 
         # ============================
         # TRANSPOSITION TABLE LOOKUP
