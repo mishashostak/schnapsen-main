@@ -709,7 +709,7 @@ def _state_key(state: GameState) -> tuple:
 
 @dataclass(frozen=True)
 class SearchConfig:
-    max_depth_phase1: int = 8
+    max_depth_phase1: int = 9
     use_heuristic: bool = True
 
 
@@ -733,7 +733,7 @@ class HonestBot(Bot):
         # PERFORMANCE ADDITIONS
         self._tt = {}
         self._nodes = 0
-        self._node_budget = 100000
+        self._node_budget = 40000
         self._scorer = SchnapsenTrickScorer()
 
 
@@ -760,7 +760,7 @@ class HonestBot(Bot):
             state = _peek_full_state(perspective)
 
             self._nodes = 0
-            d = min(4, self.config.max_depth_phase1)  # small depth is usually enough here
+            d = min(6, self.config.max_depth_phase1)  # small depth is usually enough here
             val, mv = self._value_phase1(
                 state=state,
                 engine=engine,
