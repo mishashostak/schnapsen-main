@@ -804,25 +804,19 @@ class HonestBot(Bot):
 
 
     def _value_phase1(
-    self,
-    state: GameState,
-    engine: GamePlayEngine,
-    leader_move: Optional[Move],
-    maximizing: bool,
-    depth: int,
-    alpha: float,
-    beta: float,
-) -> tuple[float, Move]:
+        self,
+        state: GameState,
+        engine: GamePlayEngine,
+        leader_move: Optional[Move],
+        maximizing: bool,
+        depth: int,
+        alpha: float,
+        beta: float,
+    ) -> tuple[float, Move]:
 
-        # Node budget cutoff (guarantees speed)
-        self._nodes += 1
-        if self._nodes > self._node_budget:
-            # Fallback heuristic
-            dummy_persp = LeaderPerspective(state, engine)
-            moves = dummy_persp.valid_moves()
-            return _heuristic_value(state, maximizing), moves[0]
-
-        # Build perspective
+        # -------------------------
+        # Build the CORRECT perspective FIRST (so legality is correct)
+        # -------------------------
         if leader_move is None:
             my_perspective: PlayerPerspective = LeaderPerspective(state, engine)
         else:
@@ -830,16 +824,68 @@ class HonestBot(Bot):
 
         valid_moves = my_perspective.valid_moves()
 
-        # Leader: ignore non-card moves
+        # Leader: ignore non-card moves (keeps search stable in your setup)
         if leader_move is None:
             valid_moves = [m for m in valid_moves if hasattr(m, "card")]
 
         assert valid_moves, "No valid moves found"
 
+        # -------------------------
+        # Node budget cutoff: MUST return a LEGAL move for THIS perspective
+        # and should be "best available", not random.
+        # -------------------------
+        self._nodes += 1
+        if self._nodes > self._node_budget:
+            trump = state.talon.trump_suit()
+            rank_score = {"ACE": 5, "TEN": 4, "KING": 3, "QUEEN": 2, "JACK": 1}
+
+            def sort_key(m: Move) -> int:
+                if not hasattr(m, "card"):
+                    return -100
+                c = m.card
+                rname = getattr(c.rank, "name", str(c.rank))
+                return (10 if c.suit == trump else 0) + rank_score.get(rname, 0)
+
+            # A bit of ordering makes even the cutoff smarter
+            valid_moves.sort(key=sort_key, reverse=maximizing)
+
+            best_m = valid_moves[0]
+            best_v = float("-inf") if maximizing else float("inf")
+
+            for m in valid_moves:
+                # If we're follower, we can cheaply complete the trick and evaluate the result
+                if leader_move is not None:
+                    leader_bot = OneFixedMoveBot(leader_move)
+                    follower_bot = OneFixedMoveBot(m)
+                    new_state = engine.play_one_trick(state, leader_bot, follower_bot)
+
+                    win_info = self._scorer.declare_winner(new_state)
+                    if win_info:
+                        winner_impl = win_info[0].implementation
+                        points = float(win_info[1])
+                        follower_wins = (winner_impl == follower_bot)
+                        if not follower_wins:
+                            points = -points
+                        v = points if maximizing else -points
+                    else:
+                        v = _heuristic_value(new_state, maximizing)
+                else:
+                    # If we're leader, just evaluate the current state (cheap and legal).
+                    # (If you want slightly stronger: recurse one ply, but keep it cheap.)
+                    v = _heuristic_value(state, maximizing)
+
+                if maximizing:
+                    if v > best_v:
+                        best_v, best_m = v, m
+                else:
+                    if v < best_v:
+                        best_v, best_m = v, m
+
+            return best_v, best_m
+
         # ============================
         # TRANSPOSITION TABLE LOOKUP
         # ============================
-        lm_key = None
         if leader_move is None:
             lm_key = ("L",)
         elif hasattr(leader_move, "card"):
@@ -864,7 +910,6 @@ class HonestBot(Bot):
                             return val, m
             return val, valid_moves[0]
 
-
         # ============================
         # MOVE ORDERING (huge speedup)
         # ============================
@@ -877,7 +922,6 @@ class HonestBot(Bot):
             c = m.card
             rname = getattr(c.rank, "name", str(c.rank))
             return (10 if c.suit == trump else 0) + rank_score.get(rname, 0)
-
 
         valid_moves.sort(key=sort_key, reverse=maximizing)
 
