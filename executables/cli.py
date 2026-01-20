@@ -44,42 +44,97 @@ def play_games_and_return_stats(engine: GamePlayEngine, bot1: Bot, bot2: Bot, pa
     return bot1_wins
 
 @main.command()
-def honest_vs_rdeep() -> None:
+@click.option("--games", default=200, show_default=True, type=int)
+@click.option("--seed0", default=1, show_default=True, type=int)
+@click.option("--rdeep-samples", default=16, show_default=True, type=int)
+@click.option("--rdeep-depth", default=4, show_default=True, type=int)
+@click.option("--progress-every", default=5, show_default=True, type=int)
+@click.option("--outfile", default="honest_vs_rdeep_report.txt", show_default=True, type=str)
+def honest_vs_rdeep(
+    games: int,
+    seed0: int,
+    rdeep_samples: int,
+    rdeep_depth: int,
+    progress_every: int,
+    outfile: str,
+) -> None:
     """
-    Play your perfect-info Phase1 AlphaBeta + Phase2 regular AlphaBeta bot vs RdeepBot.
-    Swaps seats every other game, similar to rdeep_game().
+    HonestBot vs RdeepBot.
+    - Alternates seats every game.
+    - Fresh bots each game (no state leakage).
+    - Clean progress printing (exactly once).
+    - Full loss summaries written to outfile.
     """
+
+    import time
+    import random
+    from typing import List, Tuple
+
     engine = SchnapsenGamePlayEngine()
 
-    # Your perfect-info bot (tune depth as you like)
-    honest = HonestBot(
-        name="Honest",
-        config=SearchConfig(max_depth_phase1= 7, use_heuristic=True), #CHANGE MAX DEPTH HERE
-    )
-
-    # Rdeep bot (same params style as your rdeep_game)
-    rdeep = RdeepBot(num_samples=16, depth=4, rand=random.Random(4564654644))
-
-    bot1: Bot = honest
-    bot2: Bot = rdeep
+    # Import your bot class (adjust path if needed)
+    # from schnapsen.bots.honestbot import HonestBot
+    # If HonestBot is defined in this same cli.py, then just use it directly.
 
     wins = 0
-    amount = 200
+    losses: List[Tuple[int, str]] = []
 
-    for game_number in range(1, amount + 1):
-        # swap roles every other game
-        if game_number % 2 == 0:
-            bot1, bot2 = bot2, bot1
+    t0 = time.time()
 
-        winner_id, game_points, score = engine.play_game(bot1, bot2, random.Random(game_number))
+    with open(outfile, "w", encoding="utf-8") as f:
+        f.write("HONEST VS RDEEP REPORT\n")
+        f.write(f"games={games} seed0={seed0}\n")
+        f.write(f"rdeep_samples={rdeep_samples} rdeep_depth={rdeep_depth}\n\n")
 
-        # count wins for the perfect-info bot
-        if winner_id == honest:
-            wins += 1
+        for i in range(games):
+            seed = seed0 + i
+            rng = random.Random(seed)
 
-        if game_number % 5 == 0:
-            print(f"Honest won {wins} out of {game_number} games "
-                  f"(last game: winner={winner_id}, points={game_points}, score={score})")
+            # Fresh bots each game
+            honest = HonestBot(name="Honest")  # <-- your renamed bot
+            rdeep = RdeepBot(
+                num_samples=rdeep_samples,
+                depth=rdeep_depth,
+                rand=random.Random(99991 + seed),
+            )
+
+            # Alternate seats every game:
+            # odd games: Honest is bot1 (leader at start)
+            # even games: Honest is bot2
+            if (i % 2) == 0:
+                bot1, bot2 = honest, rdeep
+                seats = "H-first"
+            else:
+                bot1, bot2 = rdeep, honest
+                seats = "H-second"
+
+            winner, game_points, score = engine.play_game(bot1, bot2, rng)
+
+            honest_won = (winner == honest)
+            if honest_won:
+                wins += 1
+            else:
+                # Keep a compact loss line (don’t spam stdout)
+                line = f"LOSS seed={seed} seats={seats} winner={winner} game_points={game_points} score={score}"
+                losses.append((seed, line))
+                f.write(line + "\n")
+
+            # Progress printing EXACTLY ONCE
+            if progress_every > 0 and ((i + 1) % progress_every == 0 or (i + 1) == games):
+                print(f"Progress {i+1}/{games} | wins={wins} | winrate={wins/(i+1):.1%}")
+
+        runtime = time.time() - t0
+        f.write("\n")
+        f.write(f"SUMMARY wins={wins}/{games} ({wins/games:.2%})\n")
+        f.write(f"runtime_seconds={runtime:.2f}\n")
+        f.write(f"losses={len(losses)}\n")
+        if losses:
+            f.write("loss_seeds:\n")
+            for s, _ in losses:
+                f.write(f"  - {s}\n")
+
+    print(f"\nDONE. Wins={wins}/{games} ({wins/games:.2%})")
+    print(f"Wrote report to: {outfile}")
 
 
 @main.command()

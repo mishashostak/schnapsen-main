@@ -338,6 +338,10 @@ def _rig_to_best_five_safe(perspective: PlayerPerspective, leader_move: Optional
     - Uses only 1-for-1 swaps.
     """
     state: GameState = perspective._PlayerPerspective__game_state  # type: ignore[attr-defined]
+    
+    # Step 0: enforce trump jack at bottom (safe) EVERY TIME
+    _ensure_trump_jack_bottom_safe(perspective, leader_move)
+    
     trump_suit = state.talon.trump_suit()
 
     if perspective.am_i_leader():
@@ -531,6 +535,20 @@ def _ensure_trump_jack_bottom_safe(perspective: PlayerPerspective, leader_move: 
     state.talon._cards[:] = talon_cards  # type: ignore[attr-defined]
 
 
+def _player_id(p: Any) -> Any:
+    """
+    Best-effort stable identifier for a player across copied GameStates.
+    We try several common attribute names used in schnapsen repos.
+    """
+    for attr in ("player_id", "id", "position", "seat", "index", "identifier", "number"):
+        if hasattr(p, attr):
+            return getattr(p, attr)
+    # fallback: repr/name (still more stable than bot instance equality)
+    if hasattr(p, "name"):
+        return getattr(p, "name")
+    return repr(p)
+
+
 def _peek_full_state(perspective: PlayerPerspective) -> GameState:
     # Name-mangled private attribute: PlayerPerspective.__game_state
     return perspective._PlayerPerspective__game_state  # type: ignore[attr-defined]
@@ -663,21 +681,22 @@ def _should_play_marriage(perspective: PlayerPerspective) -> bool:
 
 def _state_key(state: GameState) -> tuple:
     def card_id(c) -> tuple:
-        # Convert to totally orderable primitives
         suit = getattr(c.suit, "name", str(c.suit))
         rank = getattr(c.rank, "name", str(c.rank))
         return (suit, rank)
 
+    trump = getattr(state.talon.trump_suit(), "name", str(state.talon.trump_suit()))
+
     leader_hand = tuple(sorted(card_id(c) for c in state.leader.hand.cards))
     follower_hand = tuple(sorted(card_id(c) for c in state.follower.hand.cards))
 
-    # Talon order matters, so DO NOT sort it
     if hasattr(state.talon, "_cards"):
         talon = tuple(card_id(c) for c in state.talon._cards)  # type: ignore[attr-defined]
     else:
         talon = tuple()
 
     return (
+        trump,
         leader_hand,
         follower_hand,
         talon,
@@ -686,7 +705,6 @@ def _state_key(state: GameState) -> tuple:
         int(getattr(state.leader.score, "pending_points", 0)),
         int(getattr(state.follower.score, "pending_points", 0)),
     )
-
 
 
 @dataclass(frozen=True)
@@ -715,7 +733,7 @@ class HonestBot(Bot):
         # PERFORMANCE ADDITIONS
         self._tt = {}
         self._nodes = 0
-        self._node_budget = 20000
+        self._node_budget = 100000
         self._scorer = SchnapsenTrickScorer()
 
 
@@ -836,52 +854,70 @@ class HonestBot(Bot):
         # -------------------------
         self._nodes += 1
         if self._nodes > self._node_budget:
-            trump = state.talon.trump_suit()
-            rank_score = {"ACE": 5, "TEN": 4, "KING": 3, "QUEEN": 2, "JACK": 1}
+            # Budget cutoff: pick best LEGAL move using a cheap 1-trick lookahead.
+            # This avoids "all moves look identical" on leader turns.
 
-            def sort_key(m: Move) -> int:
-                if not hasattr(m, "card"):
-                    return -100
-                c = m.card
-                rname = getattr(c.rank, "name", str(c.rank))
-                return (10 if c.suit == trump else 0) + rank_score.get(rname, 0)
+            def eval_after_trick(ls: GameState, maxing: bool) -> float:
+                win_info = self._scorer.declare_winner(ls)
+                if win_info:
+                    winner_impl = win_info[0].implementation
+                    points = float(win_info[1])
 
-            # A bit of ordering makes even the cutoff smarter
-            valid_moves.sort(key=sort_key, reverse=maximizing)
+                    # winner_impl is either new_state.leader.implementation or follower.implementation
+                    # We score from the perspective of "maximizing player" at THIS node.
+                    # When leader_move is not None we're at follower node, so follower_bot corresponds.
+                    return points if maxing else -points
+                return _heuristic_value(ls, maxing)
 
             best_m = valid_moves[0]
             best_v = float("-inf") if maximizing else float("inf")
 
-            for m in valid_moves:
-                # If we're follower, we can cheaply complete the trick and evaluate the result
-                if leader_move is not None:
+            # Leader node: test each leader move against the BEST opponent response (minimax over replies)
+            if leader_move is None:
+                for m in valid_moves:
+                    # Opponent will respond as follower with a legal move.
+                    # Build a follower perspective for the same state using leader move m.
+                    opp_p = FollowerPerspective(state, engine, m)
+                    opp_moves = opp_p.valid_moves()
+                    if not opp_moves:
+                        v = _heuristic_value(state, maximizing)
+                    else:
+                        # opponent chooses best for themselves => worst for us
+                        worst_for_us = float("inf")
+                        for fm in opp_moves:
+                            leader_bot = OneFixedMoveBot(m)
+                            follower_bot = OneFixedMoveBot(fm)
+                            ns = engine.play_one_trick(state, leader_bot, follower_bot)
+                            v_ns = eval_after_trick(ns, maximizing)
+                            if v_ns < worst_for_us:
+                                worst_for_us = v_ns
+                        v = worst_for_us
+
+                    if maximizing:
+                        if v > best_v:
+                            best_v, best_m = v, m
+                    else:
+                        if v < best_v:
+                            best_v, best_m = v, m
+
+                return best_v, best_m
+
+            # Follower node: just complete the trick for each reply and score it
+            else:
+                for m in valid_moves:
                     leader_bot = OneFixedMoveBot(leader_move)
                     follower_bot = OneFixedMoveBot(m)
-                    new_state = engine.play_one_trick(state, leader_bot, follower_bot)
+                    ns = engine.play_one_trick(state, leader_bot, follower_bot)
+                    v = eval_after_trick(ns, maximizing)
 
-                    win_info = self._scorer.declare_winner(new_state)
-                    if win_info:
-                        winner_impl = win_info[0].implementation
-                        points = float(win_info[1])
-                        follower_wins = (winner_impl == follower_bot)
-                        if not follower_wins:
-                            points = -points
-                        v = points if maximizing else -points
+                    if maximizing:
+                        if v > best_v:
+                            best_v, best_m = v, m
                     else:
-                        v = _heuristic_value(new_state, maximizing)
-                else:
-                    # If we're leader, just evaluate the current state (cheap and legal).
-                    # (If you want slightly stronger: recurse one ply, but keep it cheap.)
-                    v = _heuristic_value(state, maximizing)
+                        if v < best_v:
+                            best_v, best_m = v, m
 
-                if maximizing:
-                    if v > best_v:
-                        best_v, best_m = v, m
-                else:
-                    if v < best_v:
-                        best_v, best_m = v, m
-
-            return best_v, best_m
+                return best_v, best_m
 
         # ============================
         # TRANSPOSITION TABLE LOOKUP
@@ -940,16 +976,19 @@ class HonestBot(Bot):
                     beta=beta,
                 )
             else:
-                leader = OneFixedMoveBot(leader_move)
-                follower = OneFixedMoveBot(move)
+                leader_bot = OneFixedMoveBot(leader_move)
+                follower_bot = OneFixedMoveBot(move)
 
-                new_state = engine.play_one_trick(state, leader, follower)
+                new_state = engine.play_one_trick(state, leader_bot, follower_bot)
 
                 winning_info = self._scorer.declare_winner(new_state)
                 if winning_info:
-                    winner_impl = winning_info[0].implementation
+                    # winner_player is a Player (leader or follower of new_state), not a bot.
+                    winner_player = winning_info[0]
                     points = float(winning_info[1])
-                    follower_wins = (winner_impl == follower)
+
+                    # Robust: check which SIDE won, not which bot object instance won.
+                    follower_wins = (winner_player == new_state.follower)
                     if not follower_wins:
                         points = -points
                     if not maximizing:
@@ -959,8 +998,10 @@ class HonestBot(Bot):
                     if depth <= 1:
                         value = _heuristic_value(new_state, maximizing)
                     else:
-                        leader_stayed = (leader == new_state.leader.implementation)
+                        # Robust: determine if the SAME PLAYER remains leader after the trick.
+                        leader_stayed = (_player_id(new_state.leader) == _player_id(state.leader))
                         next_max = (not maximizing) if leader_stayed else maximizing
+
                         value, _ = self._value_phase1(
                             new_state, engine, None, next_max, depth - 1, alpha, beta
                         )
