@@ -1,7 +1,7 @@
 import random
 import pathlib
 
-from typing import Optional, List, Tuple, Any
+from typing import Optional, List, Any
 
 import click
 from schnapsen.alternative_engines.ace_one_engine import AceOneGamePlayEngine
@@ -11,7 +11,9 @@ from schnapsen.bots import MLDataBot, train_ML_model, MLPlayingBot, RandBot
 from schnapsen.bots.example_bot import ExampleBot
 
 from schnapsen.game import (Bot, GamePlayEngine, Move, PlayerPerspective,
-                            SchnapsenGamePlayEngine, TrumpExchange)
+                            SchnapsenGamePlayEngine, TrumpExchange,
+                            LeaderPerspective, FollowerPerspective,
+                            SchnapsenTrickScorer, GameState, BotState)
 from schnapsen.alternative_engines.twenty_four_card_schnapsen import TwentyFourSchnapsenGamePlayEngine
 
 from schnapsen.bots.rdeep import RdeepBot
@@ -95,7 +97,7 @@ def honest_vs_rdeep(
             rdeep = RdeepBot(
                 num_samples=rdeep_samples,
                 depth=rdeep_depth,
-                rand=random.Random(99991 + seed),
+                rand=random.Random(99999 + seed),
             )
 
             # Alternate seats every game:
@@ -438,6 +440,208 @@ def honestbot_tournament(
     print("\nDONE.")
     print(f"Overall: {overall_wins}/{overall_games} ({(overall_wins/overall_games):.2%})")
     print(f"Wrote report to: {outfile}")
+
+
+def card_str(c: Any) -> str:
+    rank_name = getattr(getattr(c, "rank", None), "name", str(getattr(c, "rank", ""))).upper()
+    suit_name = getattr(getattr(c, "suit", None), "name", str(getattr(c, "suit", ""))).upper()
+
+    rank_short = {"ACE": "A", "TEN": "10", "KING": "K", "QUEEN": "Q", "JACK": "J"}
+    suit_sym = {"HEARTS": "♥", "DIAMONDS": "♦", "CLUBS": "♣", "SPADES": "♠"}
+
+    return f"{rank_short.get(rank_name, rank_name)}{suit_sym.get(suit_name, suit_name)}"
+
+
+def sorted_hand_str(cards: List[Any], trump_suit: Any) -> str:
+    """Sort trump highest-to-lowest first, then other suits."""
+    rank_order = {"ACE": 0, "TEN": 1, "KING": 2, "QUEEN": 3, "JACK": 4}
+
+    def key(c: Any):
+        suit = getattr(c, "suit", None)
+        rank_name = getattr(getattr(c, "rank", None), "name", str(getattr(c, "rank", ""))).upper()
+        is_trump = 1 if suit == trump_suit else 0
+        rank_val = rank_order.get(rank_name, 5)
+        suit_val = {"HEARTS": 0, "DIAMONDS": 1, "CLUBS": 2, "SPADES": 3}.get(
+            getattr(suit, "name", str(suit)).upper(), 4
+        )
+        return (-is_trump, rank_val, suit_val)
+
+    return " ".join(card_str(c) for c in sorted(cards, key=key))
+
+
+def move_str(m: Any) -> str:
+    if hasattr(m, "card"):
+        return card_str(m.card)
+    class_name = type(m).__name__
+    if "Marriage" in class_name:
+        suit_name = getattr(getattr(m, "suit", None), "name", "?")
+        return f"Marriage {suit_name}"
+    if "TrumpExchange" in class_name:
+        return "Trump Exchange"
+    return class_name
+
+
+def _summarize_losses(seeds: List[int]) -> None:
+    engine = SchnapsenGamePlayEngine()
+
+    losses = []
+    for seed in seeds:
+        # Exact internal randomness for RDeep (matches your function)
+        rdeep_rand = random.Random(999999)
+
+        # Fresh bots
+        honest = HonestBot(name="HonestBot")
+        rdeep = RdeepBot(num_samples=16, depth=4, rand=rdeep_rand)
+
+        # Honest ALWAYS second (follower first) – the problematic case
+        rng = random.Random(seed)
+        winner, game_points, _ = engine.play_game(rdeep, honest, rng)
+
+        honest_won = winner is honest
+
+        if honest_won:
+            print(f"Seed {seed:3d}: WIN  (Honest second)")
+        else:
+            print(f"Seed {seed:3d}: LOSS (Honest second) – RDeep wins {game_points} game points")
+            losses.append(seed)
+
+    print("\n" + "="*60)
+    if losses:
+        print(f"Total losses when Honest is second: {len(losses)} / {len(seeds)} on seeds: {losses}")
+        print("Run `python executables/cli.py debug-seed --seed <number>` for a full trick-by-trick log.")
+    else:
+        print("Perfect – HonestBot wins even when following first on all tested seeds!")
+
+
+def detailed_game_for_seed(seed: int) -> None:
+    engine = SchnapsenGamePlayEngine()
+
+    # Exact internal randomness for RDeep
+    rdeep_rand = random.Random(999999)
+
+    honest = HonestBot(name="HonestBot")
+    rdeep = RdeepBot(num_samples=16, depth=4, rand=rdeep_rand)
+
+    rng = random.Random(seed)
+
+    # Manual initial state
+    deck = engine.deck_generator.get_initial_deck()
+    shuffled = engine.deck_generator.shuffle_deck(deck, rng)
+    leader_hand, follower_hand, talon = engine.hand_generator.generateHands(shuffled)
+
+    # Honest ALWAYS second (RDeep leads first)
+    leader_state = BotState(implementation=rdeep, hand=leader_hand)
+    follower_state = BotState(implementation=honest, hand=follower_hand)
+
+    game_state = GameState(
+        leader=leader_state,
+        follower=follower_state,
+        talon=talon,
+        previous=None,
+    )
+
+    print(f"\n{'='*80}")
+    print(f"DETAILED LOG – SEED {seed} | HonestBot FOLLOWS FIRST (second seat)")
+    print(f"{'='*80}")
+
+    trick_number = 1
+    while True:
+        trump_suit = game_state.trump_suit
+        trump_name = getattr(trump_suit, "name", str(trump_suit)).upper()
+
+        honest_is_leader = game_state.leader.implementation is honest
+
+        honest_hand = game_state.leader.hand if honest_is_leader else game_state.follower.hand
+        rdeep_hand = game_state.follower.hand if honest_is_leader else game_state.leader.hand
+
+        honest_direct = game_state.leader.score.direct_points if honest_is_leader else game_state.follower.score.direct_points
+        honest_pending = game_state.leader.score.pending_points if honest_is_leader else game_state.follower.score.pending_points
+        rdeep_direct = game_state.follower.score.direct_points if honest_is_leader else game_state.leader.score.direct_points
+        rdeep_pending = game_state.follower.score.pending_points if honest_is_leader else game_state.leader.score.pending_points
+
+        talon_size = len(game_state.talon._cards)
+
+        print(f"\n--- Trick {trick_number} | Trump: {trump_name} | Talon: {talon_size} cards ---")
+        print(f"Leader: {'HonestBot' if honest_is_leader else 'RDeepBot'}")
+        print(f"Scores → HonestBot: {honest_direct} (pending: {honest_pending}) | RDeepBot: {rdeep_direct} (pending: {rdeep_pending})")
+        print(f"HonestBot hand: {sorted_hand_str(honest_hand.cards, trump_suit)}")
+        print(f"RDeepBot  hand: {sorted_hand_str(rdeep_hand.cards, trump_suit)}")
+
+        leader_perspective = LeaderPerspective(game_state, engine)
+        leader_move = game_state.leader.implementation.get_move(leader_perspective, None)
+        print(f"Leader plays → {move_str(leader_move)}")
+
+        if leader_move.is_trump_exchange():
+            print("→ Trump Exchange – trick ends (leader remains leader)")
+            new_game_state = engine.trick_implementer.play_trick_with_fixed_leader_move(
+                engine, game_state, leader_move
+            )
+
+        else:
+            follower_perspective = FollowerPerspective(game_state, engine, leader_move)
+            follower_move = game_state.follower.implementation.get_move(follower_perspective, leader_move)
+            print(f"Follower plays → {move_str(follower_move)}")
+
+            if leader_move.is_marriage():
+                leader_card = leader_move.underlying_regular_move().card
+            else:
+                leader_card = leader_move.card
+            follower_card = follower_move.card
+
+            scorer = SchnapsenTrickScorer()
+            leader_pts = scorer.rank_to_points(leader_card.rank)
+            follower_pts = scorer.rank_to_points(follower_card.rank)
+            card_points = leader_pts + follower_pts
+
+            if leader_card.suit == follower_card.suit:
+                leader_wins = leader_pts > follower_pts
+            elif leader_card.suit == trump_suit:
+                leader_wins = True
+            elif follower_card.suit == trump_suit:
+                leader_wins = False
+            else:
+                leader_wins = True
+
+            winner_name = "Leader" if leader_wins else "Follower"
+            print(f"→ Trick won by {winner_name} (+{card_points} card points)")
+
+            new_game_state = engine.trick_implementer.play_trick_with_fixed_leader_move(
+                engine, game_state, leader_move
+            )
+
+        if talon_size > 0 and len(new_game_state.talon._cards) < talon_size:
+            print(f"→ Cards drawn from talon (winner takes first)")
+
+        game_state = new_game_state
+        trick_number += 1
+
+        winning_info = engine.trick_scorer.declare_winner(game_state)
+        if winning_info:
+            winner_botstate, game_points = winning_info
+            winner_name = "HonestBot" if winner_botstate.implementation is honest else "RDeepBot"
+
+            final_honest = honest_direct + honest_pending if honest_is_leader else (game_state.follower.score.direct_points + game_state.follower.score.pending_points)
+            final_rdeep = rdeep_direct + rdeep_pending if honest_is_leader else (game_state.leader.score.direct_points + game_state.leader.score.pending_points)
+
+            print(f"\n{'='*80}")
+            print(f"GAME OVER – {winner_name} wins ({game_points} game points)!")
+            print(f"Final card points → HonestBot: {final_honest} | RDeepBot: {final_rdeep}")
+            print(f"{'='*80}")
+            break
+
+
+@main.command()
+def summary_losses():
+    """Summary over known seeds – ONLY when HonestBot follows first (second seat)."""
+    seeds = [8, 10, 22, 26, 80, 82, 92, 112, 148, 158, 160, 168, 188]
+    _summarize_losses(seeds)
+
+
+@main.command()
+@click.option('--seed', type=int, required=True)
+def debug_seed(seed: int):
+    """Full trick-by-trick log – ONLY when HonestBot follows first (second seat)."""
+    detailed_game_for_seed(seed)
 
 
 @main.command()

@@ -201,22 +201,8 @@ class OneFixedMoveBot(Bot):
 # =============================================================================
 # Phase-1: PERFECT-INFO AlphaBeta (cheats by peeking full GameState)
 # =============================================================================
-def _rig_to_opening_hand_safe(perspective: PlayerPerspective, leader_move: Optional[Move]) -> None:
-    """
-    Safe opening rig for BOTH leader and follower:
-
-    - First: ensure TRUMP JACK is at bottom of talon (if safely possible) and protect talon[-1] forever.
-    - Then: force OUR hand to:
-        A(trump), 10(trump), K(trump), Q(trump) + one ACE (prefer non-trump Ace).
-    - Uses only 1-for-1 swaps.
-    - Never touches protected bottom talon card.
-    - If follower and leader_move has .card, that leader card is LOCKED and never moved/replaced.
-    """
+def _rig_hand_optimally(perspective: PlayerPerspective, leader_move: Optional[Move]) -> None:
     state: GameState = perspective._PlayerPerspective__game_state  # type: ignore[attr-defined]
-
-    # Step 0: enforce trump jack at bottom (safe)
-    _ensure_trump_jack_bottom_safe(perspective, leader_move)
-
     trump_suit = state.talon.trump_suit()
 
     if perspective.am_i_leader():
@@ -229,308 +215,117 @@ def _rig_to_opening_hand_safe(perspective: PlayerPerspective, leader_move: Optio
     my_cards: List[Any] = list(me.hand.cards)
     opp_cards: List[Any] = list(opp.hand.cards)
     talon_cards: List[Any] = list(getattr(state.talon, "_cards", []))
-    if not talon_cards:
+
+    hand_size = len(my_cards)
+    if hand_size == 0 or not (my_cards + opp_cards + talon_cards):
         return
 
-    bottom_idx = len(talon_cards) - 1
-    protected = talon_cards[bottom_idx]  # must be the trump jack if it was safely enforceable
+    # === NEW: Protect the bottom card forever ===
+    bottom_card = talon_cards[-1] if talon_cards else None
 
     def _name(x: Any) -> str:
         return getattr(x, "name", str(x))
 
     def card_key(c: Any) -> tuple[str, str]:
-        return (_name(getattr(c, "rank", None)), _name(getattr(c, "suit", None)))
-
-    def rank_name(c: Any) -> str:
-        return _name(getattr(c, "rank", None))
-
-    def is_trump(c: Any) -> bool:
-        return getattr(c, "suit", None) == trump_suit
-
-    # Locked leader card key (rank,suit)
-    locked_key: Optional[tuple[str, str]] = None
-    if leader_move is not None and hasattr(leader_move, "card"):
-        lc = leader_move.card  # type: ignore[attr-defined]
-        locked_key = card_key(lc)
-
-    # Pool excludes protected bottom and excludes locked leader card (if any)
-    pool: List[Any] = []
-    for c in (my_cards + opp_cards + talon_cards):
-        if c is protected:
-            continue
-        if locked_key is not None and card_key(c) == locked_key:
-            continue
-        pool.append(c)
-
-    def find_card(pred) -> Optional[Any]:
-        for c in pool:
-            if pred(c):
-                return c
-        return None
-
-    trump_ace = find_card(lambda c: is_trump(c) and rank_name(c) == "ACE")
-    trump_ten = find_card(lambda c: is_trump(c) and rank_name(c) == "TEN")
-    trump_king = find_card(lambda c: is_trump(c) and rank_name(c) == "KING")
-    trump_queen = find_card(lambda c: is_trump(c) and rank_name(c) == "QUEEN")
-    if None in (trump_ace, trump_ten, trump_king, trump_queen):
-        return
-
-    non_trump_ace = find_card(lambda c: (not is_trump(c)) and rank_name(c) == "ACE")
-    any_other_ace = find_card(
-        lambda c: rank_name(c) == "ACE" and c not in {trump_ace, trump_ten, trump_king, trump_queen}
-    )
-    fifth = non_trump_ace or any_other_ace
-    if fifth is None:
-        return
-
-    desired = [trump_ace, trump_ten, trump_king, trump_queen, fifth]
-
-    if set(desired) == set(my_cards):
-        # still write back in case helper changed lists
-        me.hand.cards[:] = my_cards
-        opp.hand.cards[:] = opp_cards
-        state.talon._cards[:] = talon_cards  # type: ignore[attr-defined]
-        return
-
-    missing = [c for c in desired if c not in my_cards]
-    give_back = [c for c in my_cards if c not in desired]
-    if len(missing) != len(give_back):
-        return
-
-    for take, give in zip(missing, give_back):
-        # guard rails
-        if take is protected:
-            return
-        if locked_key is not None and card_key(take) == locked_key:
-            return
-        if locked_key is not None and card_key(give) == locked_key:
-            return
-
-        if take in opp_cards:
-            idx = opp_cards.index(take)
-            if locked_key is not None and card_key(opp_cards[idx]) == locked_key:
-                return
-            opp_cards[idx] = give
-
-        elif take in talon_cards:
-            idx = talon_cards.index(take)
-            if idx == bottom_idx:
-                return
-            talon_cards[idx] = give
-
-        else:
-            return
-
-    # Write back
-    me.hand.cards[:] = desired
-    opp.hand.cards[:] = opp_cards
-    state.talon._cards[:] = talon_cards  # type: ignore[attr-defined]
-
-
-def _rig_to_best_five_safe(perspective: PlayerPerspective, leader_move: Optional[Move]) -> None:
-    """
-    Unified best-5 rig for BOTH leader and follower turns.
-
-    - Ensures trump JACK is at talon bottom if safely possible.
-    - Protects talon[-1] forever (never modified after).
-    - If follower and leader_move has .card, locks that leader card (cannot be moved/replaced).
-    - Chooses best 5 by strength: trump first, then A > 10 > K > Q > J.
-    - Uses only 1-for-1 swaps.
-    """
-    state: GameState = perspective._PlayerPerspective__game_state  # type: ignore[attr-defined]
-    
-    # Step 0: enforce trump jack at bottom (safe) EVERY TIME
-    _ensure_trump_jack_bottom_safe(perspective, leader_move)
-    
-    trump_suit = state.talon.trump_suit()
-
-    if perspective.am_i_leader():
-        me = state.leader
-        opp = state.follower
-    else:
-        me = state.follower
-        opp = state.leader
-
-    my_cards: List[Any] = list(me.hand.cards)
-    opp_cards: List[Any] = list(opp.hand.cards)
-    talon_cards: List[Any] = list(getattr(state.talon, "_cards", []))
-    if not talon_cards:
-        return
-
-    bottom_idx = len(talon_cards) - 1
-    protected = talon_cards[bottom_idx]  # should be trump jack if enforceable
-
-    def _name(x: Any) -> str:
-        return getattr(x, "name", str(x))
-
-    def card_key(c: Any) -> tuple[str, str]:
-        return (_name(getattr(c, "rank", None)), _name(getattr(c, "suit", None)))
+        rank = getattr(c, "rank", None)
+        suit = getattr(c, "suit", None)
+        return (_name(rank), _name(suit))
 
     locked_key: Optional[tuple[str, str]] = None
     if leader_move is not None and hasattr(leader_move, "card"):
-        lc = leader_move.card  # type: ignore[attr-defined]
+        lc = leader_move.card
         locked_key = card_key(lc)
+
+    # All swappable cards (exclude locked led card AND the bottom card)
+    pool: List[Any] = [
+        c for c in (my_cards + opp_cards + talon_cards)
+        if c is not bottom_card and (locked_key is None or card_key(c) != locked_key)
+    ]
 
     rank_strength = {"ACE": 5, "TEN": 4, "KING": 3, "QUEEN": 2, "JACK": 1}
 
-    def strength(c: Any) -> tuple[int, int]:
-        is_trump = 1 if getattr(c, "suit", None) == trump_suit else 0
-        rname = _name(getattr(c, "rank", None))
-        return (is_trump, rank_strength.get(rname, 0))
+    def get_strength(c: Any) -> int:
+        rank = getattr(c, "rank", None)
+        suit = getattr(c, "suit", None)
+        rname = _name(rank).upper()
+        base = rank_strength.get(rname, 0)
+        return base + 10 if suit == trump_suit else base
 
-    # Pool excludes protected + locked
-    pool: List[Any] = []
-    for c in (my_cards + opp_cards + talon_cards):
-        if c is protected:
-            continue
-        if locked_key is not None and card_key(c) == locked_key:
-            continue
-        pool.append(c)
+    # All trumps available for swapping
+    trumps_in_pool = [c for c in pool if getattr(c, "suit", None) == trump_suit]
 
-    if len(pool) < 5:
-        return
+    desired: List[Any] = []
 
-    pool_sorted = sorted(pool, key=strength, reverse=True)
-    best5 = pool_sorted[:5]
+    if leader_move is not None and hasattr(leader_move, "card"):
+        led = leader_move.card
+        led_suit = getattr(led, "suit", None)
+        led_is_trump = led_suit == trump_suit
+        led_rank_name = _name(getattr(led, "rank", None)).upper()
+        led_str = rank_strength.get(led_rank_name, 0)
 
-    # hard safety filter + refill
-    best5 = [c for c in best5 if (c is not protected) and (locked_key is None or card_key(c) != locked_key)]
-    if len(best5) < 5:
-        for c in pool_sorted:
-            if c is protected:
-                continue
-            if locked_key is not None and card_key(c) == locked_key:
-                continue
-            if c not in best5:
-                best5.append(c)
-            if len(best5) == 5:
-                break
-    if len(best5) != 5:
-        return
+        if led_is_trump:
+            # Beat with lowest possible higher trump
+            beaters = [
+                c for c in trumps_in_pool
+                if rank_strength.get(_name(getattr(c, "rank", None)).upper(), 0) > led_str
+            ]
+            if beaters:
+                beaters.sort(key=get_strength)  # lowest beater first
+                desired.append(beaters[0])
+                trumps_in_pool.remove(beaters[0])
 
-    if set(best5) == set(my_cards):
-        return
-
-    missing = [c for c in best5 if c not in my_cards]
-    give_back = [c for c in my_cards if c not in best5]
-    if len(missing) != len(give_back):
-        return
-
-    for take, give in zip(missing, give_back):
-        if take is protected:
-            return
-        if locked_key is not None and card_key(take) == locked_key:
-            return
-        if locked_key is not None and card_key(give) == locked_key:
-            return
-
-        if take in opp_cards:
-            idx = opp_cards.index(take)
-            if locked_key is not None and card_key(opp_cards[idx]) == locked_key:
-                return
-            opp_cards[idx] = give
-
-        elif take in talon_cards:
-            idx = talon_cards.index(take)
-            if idx == bottom_idx:
-                return
-            talon_cards[idx] = give
+            # Take remaining trumps highest-first
+            trumps_in_pool.sort(key=get_strength, reverse=True)
+            desired += trumps_in_pool[:hand_size - len(desired)]
 
         else:
-            return
+            # Non-trump lead → prefer cheap ruff
+            if trumps_in_pool:
+                trumps_in_pool.sort(key=get_strength)  # lowest first
+                desired.append(trumps_in_pool[0])
+                remaining_trumps = trumps_in_pool[1:]
+                remaining_trumps.sort(key=get_strength, reverse=True)
+                desired += remaining_trumps[:hand_size - len(desired)]
+            else:
+                # No trump → try to overtake in suit with lowest possible beater
+                same_suit_cards = [c for c in pool if getattr(c, "suit", None) == led_suit]
+                beaters = [
+                    c for c in same_suit_cards
+                    if rank_strength.get(_name(getattr(c, "rank", None)).upper(), 0) > led_str
+                ]
+                if beaters:
+                    beaters.sort(key=get_strength)
+                    desired.append(beaters[0])
 
-    me.hand.cards[:] = best5
-    opp.hand.cards[:] = opp_cards
-    state.talon._cards[:] = talon_cards  # type: ignore[attr-defined]
-
-
-def _ensure_trump_jack_bottom_safe(perspective: PlayerPerspective, leader_move: Optional[Move]) -> None:
-    """
-    Try to ensure the TRUMP JACK is at the bottom of the talon (talon_cards[-1]) via 1-for-1 swaps.
-
-    SAFETY:
-    - If follower and leader_move has a card, that card is LOCKED and must stay in leader hand.
-    - Never swap with/move the locked card.
-    - After this runs, talon bottom is treated as protected by the other rig functions.
-
-    If the locked leader card IS the trump jack, we cannot safely move it -> do nothing.
-    """
-    state: GameState = perspective._PlayerPerspective__game_state  # type: ignore[attr-defined]
-    trump_suit = state.talon.trump_suit()
-
-    if perspective.am_i_leader():
-        me = state.leader
-        opp = state.follower
     else:
-        me = state.follower
-        opp = state.leader
+        # We are leader → grab highest trumps first
+        trumps_in_pool.sort(key=get_strength, reverse=True)
+        desired += trumps_in_pool[:hand_size]
 
-    my_cards: List[Any] = list(me.hand.cards)
-    opp_cards: List[Any] = list(opp.hand.cards)
-    talon_cards: List[Any] = list(getattr(state.talon, "_cards", []))
-    if not talon_cards:
+    # Fill remaining slots with the overall highest cards left in the pool
+    if len(desired) < hand_size:
+        remaining_pool = [c for c in pool if c not in desired]
+        remaining_pool.sort(key=get_strength, reverse=True)
+        desired += remaining_pool[:hand_size - len(desired)]
+
+    # Apply the swaps only if the hand actually improves
+    if set(desired) == set(my_cards):
         return
 
-    bottom_idx = len(talon_cards) - 1
+    missing = [c for c in desired if c not in my_cards]
+    excess = [c for c in my_cards if c not in desired]
 
-    def _name(x: Any) -> str:
-        return getattr(x, "name", str(x))
+    if len(missing) != len(excess):
+        return  # safety guard
 
-    def rank_name(c: Any) -> str:
-        return _name(getattr(c, "rank", None))
+    for take, give in zip(missing, excess):
+        if take in opp_cards:
+            opp_cards[opp_cards.index(take)] = give
+        elif take in talon_cards:
+            talon_cards[talon_cards.index(take)] = give
 
-    def suit_name(c: Any) -> str:
-        return _name(getattr(c, "suit", None))
-
-    def is_trump(c: Any) -> bool:
-        return getattr(c, "suit", None) == trump_suit
-
-    # locked leader card key (rank,suit) if follower
-    locked_key: Optional[tuple[str, str]] = None
-    if leader_move is not None and hasattr(leader_move, "card"):
-        lc = leader_move.card  # type: ignore[attr-defined]
-        locked_key = (_name(lc.rank), _name(lc.suit))
-
-    # Find a trump jack we are allowed to move (i.e., not locked)
-    trump_jack = None
-    for c in (my_cards + opp_cards + talon_cards):
-        if not (is_trump(c) and rank_name(c) == "JACK"):
-            continue
-        if locked_key is not None and (_name(getattr(c, "rank", None)), _name(getattr(c, "suit", None))) == locked_key:
-            # this jack is locked as leader's committed card -> cannot move
-            continue
-        trump_jack = c
-        break
-
-    if trump_jack is None:
-        return  # can't find movable trump jack safely
-
-    # If already at bottom, done
-    if talon_cards[bottom_idx] is trump_jack:
-        # write-back in case we made list copies
-        state.talon._cards[:] = talon_cards  # type: ignore[attr-defined]
-        return
-
-    bottom_card = talon_cards[bottom_idx]
-
-    # Move trump_jack to bottom by 1-for-1 swap
-    if trump_jack in talon_cards:
-        j_idx = talon_cards.index(trump_jack)
-        talon_cards[j_idx], talon_cards[bottom_idx] = talon_cards[bottom_idx], talon_cards[j_idx]
-
-    elif trump_jack in my_cards:
-        j_idx = my_cards.index(trump_jack)
-        my_cards[j_idx] = bottom_card
-        talon_cards[bottom_idx] = trump_jack
-
-    elif trump_jack in opp_cards:
-        # allowed only if not locked (we excluded locked above)
-        j_idx = opp_cards.index(trump_jack)
-        opp_cards[j_idx] = bottom_card
-        talon_cards[bottom_idx] = trump_jack
-
-    # Write back
-    me.hand.cards[:] = my_cards
+    # Write back the rigged hand
+    me.hand.cards[:] = desired
     opp.hand.cards[:] = opp_cards
     state.talon._cards[:] = talon_cards  # type: ignore[attr-defined]
 
@@ -596,32 +391,38 @@ def _pick_forced_special_move(perspective: PlayerPerspective) -> Optional[Move]:
     return None
 
 
-def _heuristic_value(state, maximizing: bool) -> float:
-    leader = state.leader
-    follower = state.follower
+def _heuristic_value_honest(state: GameState, honest_pid: Any) -> float:
+    # who is honest in THIS state?
+    lpid = _player_id(state.leader)
+    fpid = _player_id(state.follower)
 
-    # 1 Score (direct + discounted pending)
-    pts = _try_extract_direct_points(state)
-    if pts is None:
-        base = 0.0
-        l_pp = f_pp = 0
+    # score extraction (best-effort like yours)
+    l_dp = int(getattr(state.leader.score, "direct_points", 0))
+    f_dp = int(getattr(state.follower.score, "direct_points", 0))
+    l_pp = int(getattr(state.leader.score, "pending_points", 0))
+    f_pp = int(getattr(state.follower.score, "pending_points", 0))
+
+    if lpid == honest_pid:
+        my_dp, opp_dp = l_dp, f_dp
+        my_pp, opp_pp = l_pp, f_pp
+        me_hand = state.leader.hand.cards
+        opp_hand = state.follower.hand.cards
     else:
-        l_dp, f_dp = pts
-        l_pp = getattr(leader.score, "pending_points", 0)
-        f_pp = getattr(follower.score, "pending_points", 0)
-        base = (l_dp - f_dp) + 0.5 * (l_pp - f_pp)
+        my_dp, opp_dp = f_dp, l_dp
+        my_pp, opp_pp = f_pp, l_pp
+        me_hand = state.follower.hand.cards
+        opp_hand = state.leader.hand.cards
 
-    # 2 Trump count advantage
+    base = (my_dp - opp_dp) + 0.5 * (my_pp - opp_pp)
+
     trump = state.talon.trump_suit()
-    leader_trumps = sum(1 for c in leader.hand.cards if c.suit == trump)
-    follower_trumps = sum(1 for c in follower.hand.cards if c.suit == trump)
-    trump_term = 1.0 * (leader_trumps - follower_trumps)
+    my_trumps = sum(1 for c in me_hand if c.suit == trump)
+    opp_trumps = sum(1 for c in opp_hand if c.suit == trump)
 
-    # 3 Tempo (being leader is good)
-    tempo_term = 0.5
+    # small tempo bonus if honest is leader right now
+    tempo = 0.5 if _player_id(state.leader) == honest_pid else 0.0
 
-    value = base + trump_term + tempo_term
-    return value if maximizing else -value
+    return base + 1.0 * (my_trumps - opp_trumps) + tempo
 
 
 def _canonicalize_move(perspective: PlayerPerspective, chosen: Move) -> Move:
@@ -709,7 +510,7 @@ def _state_key(state: GameState) -> tuple:
 
 @dataclass(frozen=True)
 class SearchConfig:
-    max_depth_phase1: int = 9
+    max_depth_phase1: int = 8
     use_heuristic: bool = True
 
 
@@ -724,16 +525,13 @@ class HonestBot(Bot):
         self.config = config
         self._phase2_delegate = AlphaBetaBot(name=None)
 
-        # Rigging control
-        self._rigged_once = False
-
         # Marriage control
         self._marriage_played = False
 
         # PERFORMANCE ADDITIONS
         self._tt = {}
         self._nodes = 0
-        self._node_budget = 40000
+        self._node_budget = 20000
         self._scorer = SchnapsenTrickScorer()
 
 
@@ -745,13 +543,6 @@ class HonestBot(Bot):
             return self._phase2_delegate.get_move(perspective, leader_move)
 
         # -------------------------
-        # Phase 1: RIG FIRST THING (exactly once at game start)
-        # -------------------------
-        if (not self._rigged_once) and (len(perspective.get_game_history()) == 0):
-            _rig_to_opening_hand_safe(perspective, leader_move)
-            self._rigged_once = True
-
-        # -------------------------
         # If leader played a special (no .card), return the best legal move.
         # -------------------------
         if leader_move is not None and not hasattr(leader_move, "card"):
@@ -761,14 +552,15 @@ class HonestBot(Bot):
 
             self._nodes = 0
             d = min(6, self.config.max_depth_phase1)  # small depth is usually enough here
+            honest_pid = _player_id(state.leader) if perspective.am_i_leader() else _player_id(state.follower)
             val, mv = self._value_phase1(
                 state=state,
                 engine=engine,
                 leader_move=leader_move,   # follower perspective
-                maximizing=True,
                 depth=d,
                 alpha=float("-inf"),
                 beta=float("inf"),
+                honest_pid=honest_pid,
             )
             return _canonicalize_move(perspective, mv)
 
@@ -792,9 +584,9 @@ class HonestBot(Bot):
 
             if special is not None:
                 return _canonicalize_move(perspective, special)
-
-        # Keep best-5 each time it's our turn.
-        _rig_to_best_five_safe(perspective, leader_move)
+            
+        # Rig your hand.
+        _rig_hand_optimally(perspective, leader_move)
 
         # -------------------------
         # Perfect-info alpha-beta search
@@ -806,14 +598,15 @@ class HonestBot(Bot):
         self._nodes = 0
 
         for d in range(2, self.config.max_depth_phase1 + 1):
+            honest_pid = _player_id(state.leader) if perspective.am_i_leader() else _player_id(state.follower)
             val, mv = self._value_phase1(
                 state=state,
                 engine=engine,
-                leader_move=leader_move,
-                maximizing=True,
+                leader_move=leader_move,   # follower perspective
                 depth=d,
                 alpha=float("-inf"),
                 beta=float("inf"),
+                honest_pid=honest_pid,
             )
             best_move = mv
 
@@ -826,68 +619,57 @@ class HonestBot(Bot):
         state: GameState,
         engine: GamePlayEngine,
         leader_move: Optional[Move],
-        maximizing: bool,
         depth: int,
         alpha: float,
         beta: float,
+        honest_pid: Any,
     ) -> tuple[float, Move]:
 
-        # -------------------------
-        # Build the CORRECT perspective FIRST (so legality is correct)
-        # -------------------------
+        # whose turn is it (as a PLAYER), and is it Honest?
         if leader_move is None:
-            my_perspective: PlayerPerspective = LeaderPerspective(state, engine)
+            to_move_pid = _player_id(state.leader)
+            persp: PlayerPerspective = LeaderPerspective(state, engine)
         else:
-            my_perspective = FollowerPerspective(state, engine, leader_move)
+            to_move_pid = _player_id(state.follower)
+            persp = FollowerPerspective(state, engine, leader_move)
 
-        valid_moves = my_perspective.valid_moves()
+        maximizing = (to_move_pid == honest_pid)
 
-        # Leader: ignore non-card moves (keeps search stable in your setup)
+        valid_moves = persp.valid_moves()
         if leader_move is None:
             valid_moves = [m for m in valid_moves if hasattr(m, "card")]
-
         assert valid_moves, "No valid moves found"
 
-        # -------------------------
-        # Node budget cutoff: MUST return a LEGAL move for THIS perspective
-        # and should be "best available", not random.
-        # -------------------------
+        # node/depth cutoff
         self._nodes += 1
-        if self._nodes > self._node_budget or depth <= 0:
-            # Order moves first
+        if depth <= 0 or self._nodes > self._node_budget:
             trump = state.talon.trump_suit()
             rank_score = {"ACE": 5, "TEN": 4, "KING": 3, "QUEEN": 2, "JACK": 1}
 
-            def move_sort(m: Move) -> int:
+            def sort_key(m: Move) -> int:
                 if not hasattr(m, "card"):
                     return -100
                 c = m.card
                 rname = getattr(c.rank, "name", str(c.rank))
                 return (10 if c.suit == trump else 0) + rank_score.get(rname, 0)
 
-            valid_moves.sort(key=move_sort, reverse=maximizing)
-
-            # Evaluate each move cheaply but meaningfully
-            best_m = valid_moves[0]
-            best_v = float("-inf") if maximizing else float("inf")
-
+            valid_moves.sort(key=sort_key, reverse=maximizing)
+            # return the best-looking legal move with heuristic
+            # (for follower we can cheaply complete trick; for leader do 1-ply worst-case)
             if leader_move is not None:
-                # We are follower: complete trick and evaluate new_state
+                best_v = float("-inf") if maximizing else float("inf")
+                best_m = valid_moves[0]
                 for m in valid_moves:
-                    leader_bot = OneFixedMoveBot(leader_move)
-                    follower_bot = OneFixedMoveBot(m)
-                    new_state = engine.play_one_trick(state, leader_bot, follower_bot)
-
-                    win_info = self._scorer.declare_winner(new_state)
-                    if win_info:
-                        winner_impl = win_info[0].implementation
-                        points = float(win_info[1])
-                        follower_wins = (winner_impl == follower_bot)
-                        if not follower_wins:
-                            points = -points
-                        v = points if maximizing else -points
+                    lb = OneFixedMoveBot(leader_move)
+                    fb = OneFixedMoveBot(m)
+                    ns = engine.play_one_trick(state, lb, fb)
+                    win = self._scorer.declare_winner(ns)
+                    if win:
+                        winner_player = win[0]
+                        pts = float(win[1])
+                        v = pts if _player_id(winner_player) == honest_pid else -pts
                     else:
-                        v = _heuristic_value(new_state, maximizing)
+                        v = _heuristic_value_honest(ns, honest_pid)
 
                     if maximizing:
                         if v > best_v:
@@ -895,60 +677,48 @@ class HonestBot(Bot):
                     else:
                         if v < best_v:
                             best_v, best_m = v, m
-
                 return best_v, best_m
-
             else:
-                # We are leader: approximate worst-case follower reply (1-ply)
+                # leader cutoff: pessimistic 1-ply
+                best_v = float("-inf") if maximizing else float("inf")
+                best_m = valid_moves[0]
                 for m in valid_moves:
-                    # follower perspective after we lead with m
-                    foll_p = FollowerPerspective(state, engine, m)
-                    replies = foll_p.valid_moves()
-
-                    # choose a "worst reply for us" by heuristic after completing trick
-                    worst_reply = replies[0]
-                    worst_val = float("inf")
-
+                    foll = FollowerPerspective(state, engine, m)
+                    replies = foll.valid_moves()
+                    worst_for_honest = float("inf")
                     for r in replies:
-                        leader_bot = OneFixedMoveBot(m)
-                        follower_bot = OneFixedMoveBot(r)
-                        new_state = engine.play_one_trick(state, leader_bot, follower_bot)
+                        lb = OneFixedMoveBot(m)
+                        fb = OneFixedMoveBot(r)
+                        ns = engine.play_one_trick(state, lb, fb)
+                        win = self._scorer.declare_winner(ns)
+                        if win:
+                            winner_player = win[0]
+                            pts = float(win[1])
+                            v = pts if _player_id(winner_player) == honest_pid else -pts
+                        else:
+                            v = _heuristic_value_honest(ns, honest_pid)
+                        if v < worst_for_honest:
+                            worst_for_honest = v
 
-                        # from our (leader) standpoint, higher is better
-                        v = _heuristic_value(new_state, maximizing=True)
-                        if v < worst_val:
-                            worst_val = v
-                            worst_reply = r
-
-                    # value of choosing m is the worst-case reply outcome
-                    v = worst_val if maximizing else -worst_val
-
+                    v = worst_for_honest
                     if maximizing:
                         if v > best_v:
                             best_v, best_m = v, m
                     else:
                         if v < best_v:
                             best_v, best_m = v, m
-
                 return best_v, best_m
 
-
-        # ============================
-        # TRANSPOSITION TABLE LOOKUP
-        # ============================
+        # --- TT key (must include whose-turn type and depth; honest_pid constant) ---
         if leader_move is None:
             lm_key = ("L",)
         elif hasattr(leader_move, "card"):
             c = leader_move.card
-            lm_key = (
-                "F",
-                getattr(c.rank, "name", str(c.rank)),
-                getattr(c.suit, "name", str(c.suit)),
-            )
+            lm_key = ("F", getattr(c.rank, "name", str(c.rank)), getattr(c.suit, "name", str(c.suit)))
         else:
             lm_key = ("F", type(leader_move).__name__)
 
-        key = (_state_key(state), lm_key, maximizing, depth)
+        key = (_state_key(state), lm_key, to_move_pid, depth)
         if key in self._tt:
             val, move_desc = self._tt[key]
             if move_desc is not None:
@@ -960,104 +730,65 @@ class HonestBot(Bot):
                             return val, m
             return val, valid_moves[0]
 
-        # ============================
-        # MOVE ORDERING (huge speedup)
-        # ============================
+        # move ordering
         trump = state.talon.trump_suit()
         rank_score = {"ACE": 5, "TEN": 4, "KING": 3, "QUEEN": 2, "JACK": 1}
 
-        def sort_key(m: Move) -> int:
+        def order_key(m: Move) -> int:
             if not hasattr(m, "card"):
                 return -100
             c = m.card
             rname = getattr(c.rank, "name", str(c.rank))
             return (10 if c.suit == trump else 0) + rank_score.get(rname, 0)
 
-        valid_moves.sort(key=sort_key, reverse=maximizing)
+        valid_moves.sort(key=order_key, reverse=maximizing)
 
-        best_value = float("-inf") if maximizing else float("inf")
-        best_move: Optional[Move] = None
+        best_v = float("-inf") if maximizing else float("inf")
+        best_m: Optional[Move] = None
 
-        for move in valid_moves:
+        for m in valid_moves:
             if leader_move is None:
-                value, _ = self._value_phase1(
-                    state=state,
-                    engine=engine,
-                    leader_move=move,
-                    maximizing=not maximizing,
-                    depth=depth,
-                    alpha=alpha,
-                    beta=beta,
-                )
+                v, _ = self._value_phase1(state, engine, m, depth - 1, alpha, beta, honest_pid)
             else:
-                leader_bot = OneFixedMoveBot(leader_move)
-                follower_bot = OneFixedMoveBot(move)
+                lb = OneFixedMoveBot(leader_move)
+                fb = OneFixedMoveBot(m)
+                ns = engine.play_one_trick(state, lb, fb)
 
-                new_state = engine.play_one_trick(state, leader_bot, follower_bot)
-
-                winning_info = self._scorer.declare_winner(new_state)
-                if winning_info:
-                    # winner_player is a Player (leader or follower of new_state), not a bot.
-                    winner_player = winning_info[0]
-                    points = float(winning_info[1])
-
-                    # Robust: check which SIDE won, not which bot object instance won.
-                    follower_wins = (winner_player == new_state.follower)
-                    if not follower_wins:
-                        points = -points
-                    if not maximizing:
-                        points = -points
-                    value = points
+                win = self._scorer.declare_winner(ns)
+                if win:
+                    winner_player = win[0]
+                    pts = float(win[1])
+                    v = pts if _player_id(winner_player) == honest_pid else -pts
                 else:
-                    if depth <= 1:
-                        value = _heuristic_value(new_state, maximizing)
-                    else:
-                        # Robust: determine if the SAME PLAYER remains leader after the trick.
-                        leader_stayed = (_player_id(new_state.leader) == _player_id(state.leader))
-                        next_max = (not maximizing) if leader_stayed else maximizing
+                    v, _ = self._value_phase1(ns, engine, None, depth - 1, alpha, beta, honest_pid)
 
-                        value, _ = self._value_phase1(
-                            new_state, engine, None, next_max, depth - 1, alpha, beta
-                        )
-
-            # Phase-2 entry penalty
-            if len(getattr(state.talon, "_cards", [])) == 0:
-                leader_pts = state.leader.score.direct_points
-                follower_pts = state.follower.score.direct_points
-                if leader_pts < follower_pts:
-                    value -= 25
-
-            # Alpha-beta pruning
             if maximizing:
-                if value > best_value:
-                    best_value, best_move = value, move
-                alpha = max(alpha, best_value)
+                if v > best_v:
+                    best_v, best_m = v, m
+                alpha = max(alpha, best_v)
                 if beta <= alpha:
                     break
             else:
-                if value < best_value:
-                    best_value, best_move = value, move
-                beta = min(beta, best_value)
+                if v < best_v:
+                    best_v, best_m = v, m
+                beta = min(beta, best_v)
                 if beta <= alpha:
                     break
 
-        assert best_move is not None
+        assert best_m is not None
 
-        # ============================
-        # STORE IN TRANSPOSITION TABLE
-        # ============================
-        if hasattr(best_move, "card"):
-            br = getattr(best_move.card.rank, "name", str(best_move.card.rank))
-            bs = getattr(best_move.card.suit, "name", str(best_move.card.suit))
-            bm_desc = (br, bs)
+        # store TT
+        if hasattr(best_m, "card"):
+            br = getattr(best_m.card.rank, "name", str(best_m.card.rank))
+            bs = getattr(best_m.card.suit, "name", str(best_m.card.suit))
+            desc = (br, bs)
         else:
-            bm_desc = None
-        self._tt[key] = (best_value, bm_desc)
+            desc = None
+        self._tt[key] = (best_v, desc)
 
-        return best_value, best_move
+        return best_v, best_m
 
 
     def notify_game_end(self, won: bool, perspective: PlayerPerspective) -> None:
-        self._rigged_once = False
         self._marriage_played = False
 
