@@ -8,6 +8,10 @@ from .ml_bot import MLDataBot, MLPlayingBot, train_ML_model
 from .gui.guibot import SchnapsenServer
 from .minimax import MiniMaxBot
 from .bully_bot import BullyBot
+
+from .HB0 import PerfectInfoBot
+from .HB1 import PerfectInfoBot
+from .HB2 import PerfectInfoBot
 from .honest_bot import HonestBot, SearchConfig
 
-__all__ = ["RandBot", "AlphaBetaBot", "RdeepBot", "MLDataBot", "MLPlayingBot", "train_ML_model", "SchnapsenServer", "MiniMaxBot", "BullyBot", "HonestBot", "SearchConfig"]
+__all__ = ["RandBot", "AlphaBetaBot", "RdeepBot", "MLDataBot", "MLPlayingBot", "train_ML_model", "SchnapsenServer", "MiniMaxBot", "BullyBot", "HonestBot", "SearchConfig", "PerfectInfoBot"]

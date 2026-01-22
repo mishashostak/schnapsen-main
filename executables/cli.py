@@ -45,6 +45,102 @@ def play_games_and_return_stats(engine: GamePlayEngine, bot1: Bot, bot2: Bot, pa
             print(f"Progress: {game_pair + 1}/{pairs_of_games} game pairs played")
     return bot1_wins
 
+
+@main.command()
+@click.option("--games", default=200, show_default=True, type=int)
+@click.option("--seed0", default=1, show_default=True, type=int)
+@click.option("--rdeep-samples", default=16, show_default=True, type=int)
+@click.option("--rdeep-depth", default=4, show_default=True, type=int)
+@click.option("--progress-every", default=5, show_default=True, type=int)
+@click.option("--outfile", default="legacy_report.txt", show_default=True, type=str)
+def legacy(
+    games: int,
+    seed0: int,
+    rdeep_samples: int,
+    rdeep_depth: int,
+    progress_every: int,
+    outfile: str,
+) -> None:
+    """
+    HonestBot vs RdeepBot.
+    - Alternates seats every game.
+    - Fresh bots each game (no state leakage).
+    - Clean progress printing (exactly once).
+    - Full loss summaries written to outfile.
+    """
+
+    import time
+    import random
+    from typing import List, Tuple
+    from schnapsen.bots.HB2 import PerfectInfoBot
+
+    engine = SchnapsenGamePlayEngine()
+
+    # Import your bot class (adjust path if needed)
+    # from schnapsen.bots.honestbot import HonestBot
+    # If HonestBot is defined in this same cli.py, then just use it directly.
+
+    wins = 0
+    losses: List[Tuple[int, str]] = []
+
+    t0 = time.time()
+
+    with open(outfile, "w", encoding="utf-8") as f:
+        f.write("HONEST VS RDEEP REPORT\n")
+        f.write(f"games={games} seed0={seed0}\n")
+        f.write(f"rdeep_samples={rdeep_samples} rdeep_depth={rdeep_depth}\n\n")
+
+        for i in range(games):
+            seed = seed0 + i
+            rng = random.Random(seed)
+
+            # Fresh bots each game
+            honest = PerfectInfoBot(name="perf/honest")  # <-- your renamed bot
+            rdeep = RdeepBot(
+                num_samples=rdeep_samples,
+                depth=rdeep_depth,
+                rand=random.Random(99999 + seed),
+            )
+
+            # Alternate seats every game:
+            # odd games: Honest is bot1 (leader at start)
+            # even games: Honest is bot2
+            if (i % 2) == 0:
+                bot1, bot2 = honest, rdeep
+                seats = "H-first"
+            else:
+                bot1, bot2 = rdeep, honest
+                seats = "H-second"
+
+            winner, game_points, score = engine.play_game(bot1, bot2, rng)
+
+            honest_won = (winner == honest)
+            if honest_won:
+                wins += 1
+            else:
+                # Keep a compact loss line (don’t spam stdout)
+                line = f"LOSS seed={seed} seats={seats} winner={winner} game_points={game_points} score={score}"
+                losses.append((seed, line))
+                f.write(line + "\n")
+
+            # Progress printing EXACTLY ONCE
+            if progress_every > 0 and ((i + 1) % progress_every == 0 or (i + 1) == games):
+                print(f"Progress {i+1}/{games} | wins={wins} | winrate={wins/(i+1):.1%}")
+
+        runtime = time.time() - t0
+        f.write("\n")
+        f.write(f"SUMMARY wins={wins}/{games} ({wins/games:.2%})\n")
+        f.write(f"runtime_seconds={runtime:.2f}\n")
+        f.write(f"losses={len(losses)}\n")
+        if losses:
+            f.write("loss_seeds:\n")
+            for s, _ in losses:
+                f.write(f"  - {s}\n")
+
+    print(f"\nDONE. Wins={wins}/{games} ({wins/games:.2%})")
+    print(f"Wrote report to: {outfile}")
+
+
 @main.command()
 @click.option("--games", default=200, show_default=True, type=int)
 @click.option("--seed0", default=1, show_default=True, type=int)
@@ -171,7 +267,7 @@ def honestbot_tournament(
 
     # ---- your bot ----
     # If HonestBot is in the same file, remove this import.
-    from schnapsen.bots.honestbot import HonestBot  # type: ignore
+    from schnapsen.bots.honest_bot import HonestBot  # type: ignore
 
     engine = SchnapsenGamePlayEngine()
 
@@ -440,6 +536,923 @@ def honestbot_tournament(
     print("\nDONE.")
     print(f"Overall: {overall_wins}/{overall_games} ({(overall_wins/overall_games):.2%})")
     print(f"Wrote report to: {outfile}")
+
+
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+@main.command()
+@click.option("--games", default=1000, show_default=True, type=int, help="Games per opponent")
+@click.option("--seed0", default=1, show_default=True, type=int, help="First seed used for random.Random(seed)")
+@click.option("--outfile", default="HB0_report.txt", show_default=True, type=str)
+@click.option("--rdeep-samples", default=16, show_default=True, type=int)
+@click.option("--rdeep-depth", default=4, show_default=True, type=int)
+def hb0_tournament(
+    games: int,
+    seed0: int,
+    outfile: str,
+    rdeep_samples: int,
+    rdeep_depth: int,
+) -> None:
+    """
+    Runs:
+      - HonestBot vs RdeepBot (N games)
+      - HonestBot vs BullyBot (N games)
+      - HonestBot vs RandBot  (N games)
+
+    Alternates seats every game by swapping bot1/bot2.
+    Writes a report + loss summaries.
+    """
+    import time
+    import random
+    import inspect
+    import statistics
+    from typing import Optional, List, Dict, Any, Tuple
+
+    from schnapsen.game import SchnapsenGamePlayEngine, Bot  # type: ignore
+
+    # ---- your bot ----
+    # If HonestBot is in the same file, remove this import.
+    from schnapsen.bots.HB0 import PerfectInfoBot  # type: ignore
+
+    engine = SchnapsenGamePlayEngine()
+
+    # ----------------------------
+    # Import helpers (repo-robust)
+    # ----------------------------
+    def _import_first(paths: List[str], name: str):
+        last_err = None
+        for p in paths:
+            try:
+                mod = __import__(p, fromlist=[name])
+                return getattr(mod, name)
+            except Exception as e:
+                last_err = e
+        raise last_err  # type: ignore[misc]
+
+    # Try multiple common locations used in different schnapsen repos
+    def _load_bots():
+        RdeepBot = _import_first(
+            [
+                "schnapsen.bots.rdeep",
+                "schnapsen.bots.rdeep_bot",
+                "schnapsen.bots",
+            ],
+            "RdeepBot",
+        )
+        RandBot = _import_first(
+            [
+                "schnapsen.bots.rand",
+                "schnapsen.bots.rand_bot",
+                "schnapsen.bots",
+            ],
+            "RandBot",
+        )
+        BullyBot = _import_first(
+            [
+                "schnapsen.bots.bully_bot",   # <-- common in many repos
+                "schnapsen.bots.bully",       # <-- your attempted path (fails in yours)
+                "schnapsen.bots",
+            ],
+            "BullyBot",
+        )
+        return RdeepBot, BullyBot, RandBot
+
+    # ----------------------------
+    # Construction helpers
+    # ----------------------------
+    def _construct(bot_cls, seed: int, **preferred_kwargs):
+        """
+        Instantiate bot_cls, passing only kwargs that are accepted by its __init__.
+        If it requires 'rand' or 'random', we provide random.Random(seed) automatically.
+        """
+        sig = None
+        try:
+            sig = inspect.signature(bot_cls.__init__)
+        except Exception:
+            sig = None
+
+        kwargs = {}
+        if sig is not None:
+            params = sig.parameters
+
+            # provide rand/random if requested
+            if "rand" in params:
+                kwargs["rand"] = random.Random(90000 + seed)
+            if "random" in params:
+                kwargs["random"] = random.Random(90000 + seed)
+
+            # pass preferred kwargs only if accepted
+            for k, v in preferred_kwargs.items():
+                if k in params:
+                    kwargs[k] = v
+
+        # If signature unavailable, just try preferred_kwargs then fallback no-args
+        try:
+            return bot_cls(**kwargs)
+        except TypeError:
+            try:
+                return bot_cls()
+            except Exception:
+                # last resort: try with preferred kwargs directly
+                return bot_cls(**preferred_kwargs)
+
+    # ----------------------------
+    # Stats helpers
+    # ----------------------------
+    def _safe_int(x) -> Optional[int]:
+        try:
+            return int(x)
+        except Exception:
+            return None
+
+    def _extract_points(game_points) -> Optional[int]:
+        if isinstance(game_points, int):
+            return game_points
+        if isinstance(game_points, float):
+            return int(game_points)
+        if isinstance(game_points, (tuple, list)):
+            # sometimes returns (winner_points, loser_points) etc.
+            for item in game_points:
+                v = _safe_int(item)
+                if v is not None:
+                    return v
+        return None
+
+    def _extract_direct_points(score_obj) -> Optional[int]:
+        # your log shows score like Score(direct_points=95, pending_points=0)
+        if hasattr(score_obj, "direct_points"):
+            v = _safe_int(getattr(score_obj, "direct_points"))
+            if v is not None:
+                return v
+        return None
+
+    def _run_block(opponent_name: str, opponent_factory, seed_start: int, n_games: int) -> Tuple[Dict[str, Any], int]:
+        honest_wins = 0
+        opp_wins = 0
+
+        points_hist = {1: 0, 2: 0, 3: 0}
+        honest_direct_pts_when_loss: List[int] = []
+        opp_direct_pts_when_loss: List[int] = []
+
+        loss_summaries: List[str] = []
+        loss_seeds: List[int] = []
+
+        t0 = time.time()
+
+        for i in range(n_games):
+            seed = seed_start + i
+
+            honest = PerfectInfoBot(name="HB0")
+            opp = opponent_factory(seed)
+
+            bot1: Bot = honest
+            bot2: Bot = opp
+            if (i % 2) == 1:
+                bot1, bot2 = bot2, bot1
+
+            winner, game_points, score = engine.play_game(bot1, bot2, random.Random(seed))
+
+            if winner == honest:
+                honest_wins += 1
+                p = _extract_points(game_points)
+                if p in points_hist:
+                    points_hist[p] += 1
+            else:
+                opp_wins += 1
+                loss_seeds.append(seed)
+
+                # Your output shows `score` is sometimes a Score object (not a tuple).
+                # We at least capture direct_points if possible.
+                dp = _extract_direct_points(score)
+                if dp is not None:
+                    # This dp appears to be "winner direct_points" in your printout.
+                    opp_direct_pts_when_loss.append(dp)
+
+                loss_summaries.append(
+                    f"LOSS seed={seed} seats={'H-first' if bot1==honest else 'H-second'} "
+                    f"game_points={game_points} score={score}"
+                )
+
+            if (i + 1) % max(1, n_games // 10) == 0:
+                wr = honest_wins / (i + 1)
+                print(f"[{opponent_name}] {i+1}/{n_games} | wins={honest_wins} | winrate={wr:.1%}")
+
+        dt = time.time() - t0
+
+        stats = {
+            "opponent": opponent_name,
+            "games": n_games,
+            "wins": honest_wins,
+            "losses": opp_wins,
+            "winrate": honest_wins / n_games if n_games else 0.0,
+            "points_hist_when_win": points_hist,
+            "runtime_sec": dt,
+            "loss_seeds": loss_seeds,
+            "loss_summaries": loss_summaries,
+            "opp_direct_points_when_loss_best_effort": (
+                (statistics.mean(opp_direct_pts_when_loss), min(opp_direct_pts_when_loss), max(opp_direct_pts_when_loss))
+                if opp_direct_pts_when_loss else None
+            ),
+        }
+        return stats, seed_start + n_games
+
+    # ----------------------------
+    # Load opponent classes safely
+    # ----------------------------
+    try:
+        RdeepBot, BullyBot, RandBot = _load_bots()
+    except Exception as e:
+        raise RuntimeError(f"Could not import one of the bots (Rdeep/Bully/Rand). Error: {e}")
+
+    # ----------------------------
+    # Opponent factories (seeded)
+    # ----------------------------
+    def make_rdeep(seed: int):
+        # rdeep typically wants num_samples, depth, rand
+        return _construct(
+            RdeepBot,
+            seed,
+            num_samples=rdeep_samples,
+            depth=rdeep_depth,
+        )
+
+    def make_bully(seed: int):
+        # your error says BullyBot(rand=...) is required in YOUR repo
+        return _construct(BullyBot, seed)
+
+    def make_rand(seed: int):
+        # may or may not want rand
+        return _construct(RandBot, seed)
+
+    blocks = [
+        ("RdeepBot", make_rdeep),
+        ("BullyBot", make_bully),
+        ("RandBot", make_rand),
+    ]
+
+    # ----------------------------
+    # Run tournament + write report
+    # ----------------------------
+    overall_games = 0
+    overall_wins = 0
+    overall_losses = 0
+
+    seed_cursor = seed0
+
+    with open(outfile, "w", encoding="utf-8") as f:
+        f.write("HONESTBOT TOURNAMENT REPORT\n")
+        f.write(f"games_per_opponent={games} seed0={seed0}\n")
+        f.write(f"rdeep_samples={rdeep_samples} rdeep_depth={rdeep_depth}\n\n")
+
+        for name, factory in blocks:
+            f.write("=" * 80 + "\n")
+            f.write(f"{name}: {games} games (alternating seats)\n")
+            f.write("=" * 80 + "\n")
+
+            stats, seed_cursor = _run_block(name, factory, seed_cursor, games)
+
+            overall_games += stats["games"]
+            overall_wins += stats["wins"]
+            overall_losses += stats["losses"]
+
+            f.write(f"Wins: {stats['wins']}/{stats['games']} ({stats['winrate']:.2%})\n")
+            f.write(f"Runtime: {stats['runtime_sec']:.2f}s\n")
+            f.write(f"Points hist (when HonestBot wins): {stats['points_hist_when_win']}\n")
+            f.write(f"Opponent direct_points on losses (mean/min/max, best-effort): {stats['opp_direct_points_when_loss_best_effort']}\n")
+
+            if not stats["loss_seeds"]:
+                f.write("Losses: 0 ✅\n\n")
+            else:
+                f.write(f"Losses: {len(stats['loss_seeds'])}\n")
+                f.write("Loss seeds:\n")
+                for s in stats["loss_seeds"]:
+                    f.write(f"  - {s}\n")
+                f.write("\nLoss summaries:\n")
+                for line in stats["loss_summaries"]:
+                    f.write("  " + line + "\n")
+                f.write("\n")
+
+        f.write("=" * 80 + "\n")
+        f.write("OVERALL SUMMARY\n")
+        f.write("=" * 80 + "\n")
+        f.write(f"Total: {overall_wins}/{overall_games} ({(overall_wins/overall_games):.2%})\n")
+        f.write(f"Total losses: {overall_losses}\n")
+
+    print("\nDONE.")
+    print(f"Overall: {overall_wins}/{overall_games} ({(overall_wins/overall_games):.2%})")
+    print(f"Wrote report to: {outfile}")
+
+
+
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+@main.command()
+@click.option("--games", default=1000, show_default=True, type=int, help="Games per opponent")
+@click.option("--seed0", default=1, show_default=True, type=int, help="First seed used for random.Random(seed)")
+@click.option("--outfile", default="HB1_report.txt", show_default=True, type=str)
+@click.option("--rdeep-samples", default=16, show_default=True, type=int)
+@click.option("--rdeep-depth", default=4, show_default=True, type=int)
+def HB1_tournament(
+    games: int,
+    seed0: int,
+    outfile: str,
+    rdeep_samples: int,
+    rdeep_depth: int,
+) -> None:
+    """
+    Runs:
+      - HonestBot vs RdeepBot (N games)
+      - HonestBot vs BullyBot (N games)
+      - HonestBot vs RandBot  (N games)
+
+    Alternates seats every game by swapping bot1/bot2.
+    Writes a report + loss summaries.
+    """
+    import time
+    import random
+    import inspect
+    import statistics
+    from typing import Optional, List, Dict, Any, Tuple
+
+    from schnapsen.game import SchnapsenGamePlayEngine, Bot  # type: ignore
+
+    # ---- your bot ----
+    # If HonestBot is in the same file, remove this import.
+    from schnapsen.bots.HB1 import PerfectInfoBot  # type: ignore
+
+    engine = SchnapsenGamePlayEngine()
+
+    # ----------------------------
+    # Import helpers (repo-robust)
+    # ----------------------------
+    def _import_first(paths: List[str], name: str):
+        last_err = None
+        for p in paths:
+            try:
+                mod = __import__(p, fromlist=[name])
+                return getattr(mod, name)
+            except Exception as e:
+                last_err = e
+        raise last_err  # type: ignore[misc]
+
+    # Try multiple common locations used in different schnapsen repos
+    def _load_bots():
+        RdeepBot = _import_first(
+            [
+                "schnapsen.bots.rdeep",
+                "schnapsen.bots.rdeep_bot",
+                "schnapsen.bots",
+            ],
+            "RdeepBot",
+        )
+        RandBot = _import_first(
+            [
+                "schnapsen.bots.rand",
+                "schnapsen.bots.rand_bot",
+                "schnapsen.bots",
+            ],
+            "RandBot",
+        )
+        BullyBot = _import_first(
+            [
+                "schnapsen.bots.bully_bot",   # <-- common in many repos
+                "schnapsen.bots.bully",       # <-- your attempted path (fails in yours)
+                "schnapsen.bots",
+            ],
+            "BullyBot",
+        )
+        return RdeepBot, BullyBot, RandBot
+
+    # ----------------------------
+    # Construction helpers
+    # ----------------------------
+    def _construct(bot_cls, seed: int, **preferred_kwargs):
+        """
+        Instantiate bot_cls, passing only kwargs that are accepted by its __init__.
+        If it requires 'rand' or 'random', we provide random.Random(seed) automatically.
+        """
+        sig = None
+        try:
+            sig = inspect.signature(bot_cls.__init__)
+        except Exception:
+            sig = None
+
+        kwargs = {}
+        if sig is not None:
+            params = sig.parameters
+
+            # provide rand/random if requested
+            if "rand" in params:
+                kwargs["rand"] = random.Random(90000 + seed)
+            if "random" in params:
+                kwargs["random"] = random.Random(90000 + seed)
+
+            # pass preferred kwargs only if accepted
+            for k, v in preferred_kwargs.items():
+                if k in params:
+                    kwargs[k] = v
+
+        # If signature unavailable, just try preferred_kwargs then fallback no-args
+        try:
+            return bot_cls(**kwargs)
+        except TypeError:
+            try:
+                return bot_cls()
+            except Exception:
+                # last resort: try with preferred kwargs directly
+                return bot_cls(**preferred_kwargs)
+
+    # ----------------------------
+    # Stats helpers
+    # ----------------------------
+    def _safe_int(x) -> Optional[int]:
+        try:
+            return int(x)
+        except Exception:
+            return None
+
+    def _extract_points(game_points) -> Optional[int]:
+        if isinstance(game_points, int):
+            return game_points
+        if isinstance(game_points, float):
+            return int(game_points)
+        if isinstance(game_points, (tuple, list)):
+            # sometimes returns (winner_points, loser_points) etc.
+            for item in game_points:
+                v = _safe_int(item)
+                if v is not None:
+                    return v
+        return None
+
+    def _extract_direct_points(score_obj) -> Optional[int]:
+        # your log shows score like Score(direct_points=95, pending_points=0)
+        if hasattr(score_obj, "direct_points"):
+            v = _safe_int(getattr(score_obj, "direct_points"))
+            if v is not None:
+                return v
+        return None
+
+    def _run_block(opponent_name: str, opponent_factory, seed_start: int, n_games: int) -> Tuple[Dict[str, Any], int]:
+        honest_wins = 0
+        opp_wins = 0
+
+        points_hist = {1: 0, 2: 0, 3: 0}
+        honest_direct_pts_when_loss: List[int] = []
+        opp_direct_pts_when_loss: List[int] = []
+
+        loss_summaries: List[str] = []
+        loss_seeds: List[int] = []
+
+        t0 = time.time()
+
+        for i in range(n_games):
+            seed = seed_start + i
+
+            honest = PerfectInfoBot(name="HB1")
+            opp = opponent_factory(seed)
+
+            bot1: Bot = honest
+            bot2: Bot = opp
+            if (i % 2) == 1:
+                bot1, bot2 = bot2, bot1
+
+            winner, game_points, score = engine.play_game(bot1, bot2, random.Random(seed))
+
+            if winner == honest:
+                honest_wins += 1
+                p = _extract_points(game_points)
+                if p in points_hist:
+                    points_hist[p] += 1
+            else:
+                opp_wins += 1
+                loss_seeds.append(seed)
+
+                # Your output shows `score` is sometimes a Score object (not a tuple).
+                # We at least capture direct_points if possible.
+                dp = _extract_direct_points(score)
+                if dp is not None:
+                    # This dp appears to be "winner direct_points" in your printout.
+                    opp_direct_pts_when_loss.append(dp)
+
+                loss_summaries.append(
+                    f"LOSS seed={seed} seats={'H-first' if bot1==honest else 'H-second'} "
+                    f"game_points={game_points} score={score}"
+                )
+
+            if (i + 1) % max(1, n_games // 10) == 0:
+                wr = honest_wins / (i + 1)
+                print(f"[{opponent_name}] {i+1}/{n_games} | wins={honest_wins} | winrate={wr:.1%}")
+
+        dt = time.time() - t0
+
+        stats = {
+            "opponent": opponent_name,
+            "games": n_games,
+            "wins": honest_wins,
+            "losses": opp_wins,
+            "winrate": honest_wins / n_games if n_games else 0.0,
+            "points_hist_when_win": points_hist,
+            "runtime_sec": dt,
+            "loss_seeds": loss_seeds,
+            "loss_summaries": loss_summaries,
+            "opp_direct_points_when_loss_best_effort": (
+                (statistics.mean(opp_direct_pts_when_loss), min(opp_direct_pts_when_loss), max(opp_direct_pts_when_loss))
+                if opp_direct_pts_when_loss else None
+            ),
+        }
+        return stats, seed_start + n_games
+
+    # ----------------------------
+    # Load opponent classes safely
+    # ----------------------------
+    try:
+        RdeepBot, BullyBot, RandBot = _load_bots()
+    except Exception as e:
+        raise RuntimeError(f"Could not import one of the bots (Rdeep/Bully/Rand). Error: {e}")
+
+    # ----------------------------
+    # Opponent factories (seeded)
+    # ----------------------------
+    def make_rdeep(seed: int):
+        # rdeep typically wants num_samples, depth, rand
+        return _construct(
+            RdeepBot,
+            seed,
+            num_samples=rdeep_samples,
+            depth=rdeep_depth,
+        )
+
+    def make_bully(seed: int):
+        # your error says BullyBot(rand=...) is required in YOUR repo
+        return _construct(BullyBot, seed)
+
+    def make_rand(seed: int):
+        # may or may not want rand
+        return _construct(RandBot, seed)
+
+    blocks = [
+        ("RdeepBot", make_rdeep),
+        ("BullyBot", make_bully),
+        ("RandBot", make_rand),
+    ]
+
+    # ----------------------------
+    # Run tournament + write report
+    # ----------------------------
+    overall_games = 0
+    overall_wins = 0
+    overall_losses = 0
+
+    seed_cursor = seed0
+
+    with open(outfile, "w", encoding="utf-8") as f:
+        f.write("HONESTBOT TOURNAMENT REPORT\n")
+        f.write(f"games_per_opponent={games} seed0={seed0}\n")
+        f.write(f"rdeep_samples={rdeep_samples} rdeep_depth={rdeep_depth}\n\n")
+
+        for name, factory in blocks:
+            f.write("=" * 80 + "\n")
+            f.write(f"{name}: {games} games (alternating seats)\n")
+            f.write("=" * 80 + "\n")
+
+            stats, seed_cursor = _run_block(name, factory, seed_cursor, games)
+
+            overall_games += stats["games"]
+            overall_wins += stats["wins"]
+            overall_losses += stats["losses"]
+
+            f.write(f"Wins: {stats['wins']}/{stats['games']} ({stats['winrate']:.2%})\n")
+            f.write(f"Runtime: {stats['runtime_sec']:.2f}s\n")
+            f.write(f"Points hist (when HonestBot wins): {stats['points_hist_when_win']}\n")
+            f.write(f"Opponent direct_points on losses (mean/min/max, best-effort): {stats['opp_direct_points_when_loss_best_effort']}\n")
+
+            if not stats["loss_seeds"]:
+                f.write("Losses: 0 ✅\n\n")
+            else:
+                f.write(f"Losses: {len(stats['loss_seeds'])}\n")
+                f.write("Loss seeds:\n")
+                for s in stats["loss_seeds"]:
+                    f.write(f"  - {s}\n")
+                f.write("\nLoss summaries:\n")
+                for line in stats["loss_summaries"]:
+                    f.write("  " + line + "\n")
+                f.write("\n")
+
+        f.write("=" * 80 + "\n")
+        f.write("OVERALL SUMMARY\n")
+        f.write("=" * 80 + "\n")
+        f.write(f"Total: {overall_wins}/{overall_games} ({(overall_wins/overall_games):.2%})\n")
+        f.write(f"Total losses: {overall_losses}\n")
+
+    print("\nDONE.")
+    print(f"Overall: {overall_wins}/{overall_games} ({(overall_wins/overall_games):.2%})")
+    print(f"Wrote report to: {outfile}")
+
+
+
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+@main.command()
+@click.option("--games", default=1000, show_default=True, type=int, help="Games per opponent")
+@click.option("--seed0", default=1, show_default=True, type=int, help="First seed used for random.Random(seed)")
+@click.option("--outfile", default="HB2_report.txt", show_default=True, type=str)
+@click.option("--rdeep-samples", default=16, show_default=True, type=int)
+@click.option("--rdeep-depth", default=4, show_default=True, type=int)
+def HB2_tournament(
+    games: int,
+    seed0: int,
+    outfile: str,
+    rdeep_samples: int,
+    rdeep_depth: int,
+) -> None:
+    """
+    Runs:
+      - HonestBot vs RdeepBot (N games)
+      - HonestBot vs BullyBot (N games)
+      - HonestBot vs RandBot  (N games)
+
+    Alternates seats every game by swapping bot1/bot2.
+    Writes a report + loss summaries.
+    """
+    import time
+    import random
+    import inspect
+    import statistics
+    from typing import Optional, List, Dict, Any, Tuple
+
+    from schnapsen.game import SchnapsenGamePlayEngine, Bot  # type: ignore
+
+    # ---- your bot ----
+    # If HonestBot is in the same file, remove this import.
+    from schnapsen.bots.HB2 import PerfectInfoBot  # type: ignore
+
+    engine = SchnapsenGamePlayEngine()
+
+    # ----------------------------
+    # Import helpers (repo-robust)
+    # ----------------------------
+    def _import_first(paths: List[str], name: str):
+        last_err = None
+        for p in paths:
+            try:
+                mod = __import__(p, fromlist=[name])
+                return getattr(mod, name)
+            except Exception as e:
+                last_err = e
+        raise last_err  # type: ignore[misc]
+
+    # Try multiple common locations used in different schnapsen repos
+    def _load_bots():
+        RdeepBot = _import_first(
+            [
+                "schnapsen.bots.rdeep",
+                "schnapsen.bots.rdeep_bot",
+                "schnapsen.bots",
+            ],
+            "RdeepBot",
+        )
+        RandBot = _import_first(
+            [
+                "schnapsen.bots.rand",
+                "schnapsen.bots.rand_bot",
+                "schnapsen.bots",
+            ],
+            "RandBot",
+        )
+        BullyBot = _import_first(
+            [
+                "schnapsen.bots.bully_bot",   # <-- common in many repos
+                "schnapsen.bots.bully",       # <-- your attempted path (fails in yours)
+                "schnapsen.bots",
+            ],
+            "BullyBot",
+        )
+        return RdeepBot, BullyBot, RandBot
+
+    # ----------------------------
+    # Construction helpers
+    # ----------------------------
+    def _construct(bot_cls, seed: int, **preferred_kwargs):
+        """
+        Instantiate bot_cls, passing only kwargs that are accepted by its __init__.
+        If it requires 'rand' or 'random', we provide random.Random(seed) automatically.
+        """
+        sig = None
+        try:
+            sig = inspect.signature(bot_cls.__init__)
+        except Exception:
+            sig = None
+
+        kwargs = {}
+        if sig is not None:
+            params = sig.parameters
+
+            # provide rand/random if requested
+            if "rand" in params:
+                kwargs["rand"] = random.Random(90000 + seed)
+            if "random" in params:
+                kwargs["random"] = random.Random(90000 + seed)
+
+            # pass preferred kwargs only if accepted
+            for k, v in preferred_kwargs.items():
+                if k in params:
+                    kwargs[k] = v
+
+        # If signature unavailable, just try preferred_kwargs then fallback no-args
+        try:
+            return bot_cls(**kwargs)
+        except TypeError:
+            try:
+                return bot_cls()
+            except Exception:
+                # last resort: try with preferred kwargs directly
+                return bot_cls(**preferred_kwargs)
+
+    # ----------------------------
+    # Stats helpers
+    # ----------------------------
+    def _safe_int(x) -> Optional[int]:
+        try:
+            return int(x)
+        except Exception:
+            return None
+
+    def _extract_points(game_points) -> Optional[int]:
+        if isinstance(game_points, int):
+            return game_points
+        if isinstance(game_points, float):
+            return int(game_points)
+        if isinstance(game_points, (tuple, list)):
+            # sometimes returns (winner_points, loser_points) etc.
+            for item in game_points:
+                v = _safe_int(item)
+                if v is not None:
+                    return v
+        return None
+
+    def _extract_direct_points(score_obj) -> Optional[int]:
+        # your log shows score like Score(direct_points=95, pending_points=0)
+        if hasattr(score_obj, "direct_points"):
+            v = _safe_int(getattr(score_obj, "direct_points"))
+            if v is not None:
+                return v
+        return None
+
+    def _run_block(opponent_name: str, opponent_factory, seed_start: int, n_games: int) -> Tuple[Dict[str, Any], int]:
+        honest_wins = 0
+        opp_wins = 0
+
+        points_hist = {1: 0, 2: 0, 3: 0}
+        honest_direct_pts_when_loss: List[int] = []
+        opp_direct_pts_when_loss: List[int] = []
+
+        loss_summaries: List[str] = []
+        loss_seeds: List[int] = []
+
+        t0 = time.time()
+
+        for i in range(n_games):
+            seed = seed_start + i
+
+            honest = PerfectInfoBot(name="HB2")
+            opp = opponent_factory(seed)
+
+            bot1: Bot = honest
+            bot2: Bot = opp
+            if (i % 2) == 1:
+                bot1, bot2 = bot2, bot1
+
+            winner, game_points, score = engine.play_game(bot1, bot2, random.Random(seed))
+
+            if winner == honest:
+                honest_wins += 1
+                p = _extract_points(game_points)
+                if p in points_hist:
+                    points_hist[p] += 1
+            else:
+                opp_wins += 1
+                loss_seeds.append(seed)
+
+                # Your output shows `score` is sometimes a Score object (not a tuple).
+                # We at least capture direct_points if possible.
+                dp = _extract_direct_points(score)
+                if dp is not None:
+                    # This dp appears to be "winner direct_points" in your printout.
+                    opp_direct_pts_when_loss.append(dp)
+
+                loss_summaries.append(
+                    f"LOSS seed={seed} seats={'H-first' if bot1==honest else 'H-second'} "
+                    f"game_points={game_points} score={score}"
+                )
+
+            if (i + 1) % max(1, n_games // 10) == 0:
+                wr = honest_wins / (i + 1)
+                print(f"[{opponent_name}] {i+1}/{n_games} | wins={honest_wins} | winrate={wr:.1%}")
+
+        dt = time.time() - t0
+
+        stats = {
+            "opponent": opponent_name,
+            "games": n_games,
+            "wins": honest_wins,
+            "losses": opp_wins,
+            "winrate": honest_wins / n_games if n_games else 0.0,
+            "points_hist_when_win": points_hist,
+            "runtime_sec": dt,
+            "loss_seeds": loss_seeds,
+            "loss_summaries": loss_summaries,
+            "opp_direct_points_when_loss_best_effort": (
+                (statistics.mean(opp_direct_pts_when_loss), min(opp_direct_pts_when_loss), max(opp_direct_pts_when_loss))
+                if opp_direct_pts_when_loss else None
+            ),
+        }
+        return stats, seed_start + n_games
+
+    # ----------------------------
+    # Load opponent classes safely
+    # ----------------------------
+    try:
+        RdeepBot, BullyBot, RandBot = _load_bots()
+    except Exception as e:
+        raise RuntimeError(f"Could not import one of the bots (Rdeep/Bully/Rand). Error: {e}")
+
+    # ----------------------------
+    # Opponent factories (seeded)
+    # ----------------------------
+    def make_rdeep(seed: int):
+        # rdeep typically wants num_samples, depth, rand
+        return _construct(
+            RdeepBot,
+            seed,
+            num_samples=rdeep_samples,
+            depth=rdeep_depth,
+        )
+
+    def make_bully(seed: int):
+        # your error says BullyBot(rand=...) is required in YOUR repo
+        return _construct(BullyBot, seed)
+
+    def make_rand(seed: int):
+        # may or may not want rand
+        return _construct(RandBot, seed)
+
+    blocks = [
+        ("RdeepBot", make_rdeep),
+        ("BullyBot", make_bully),
+        ("RandBot", make_rand),
+    ]
+
+    # ----------------------------
+    # Run tournament + write report
+    # ----------------------------
+    overall_games = 0
+    overall_wins = 0
+    overall_losses = 0
+
+    seed_cursor = seed0
+
+    with open(outfile, "w", encoding="utf-8") as f:
+        f.write("HONESTBOT TOURNAMENT REPORT\n")
+        f.write(f"games_per_opponent={games} seed0={seed0}\n")
+        f.write(f"rdeep_samples={rdeep_samples} rdeep_depth={rdeep_depth}\n\n")
+
+        for name, factory in blocks:
+            f.write("=" * 80 + "\n")
+            f.write(f"{name}: {games} games (alternating seats)\n")
+            f.write("=" * 80 + "\n")
+
+            stats, seed_cursor = _run_block(name, factory, seed_cursor, games)
+
+            overall_games += stats["games"]
+            overall_wins += stats["wins"]
+            overall_losses += stats["losses"]
+
+            f.write(f"Wins: {stats['wins']}/{stats['games']} ({stats['winrate']:.2%})\n")
+            f.write(f"Runtime: {stats['runtime_sec']:.2f}s\n")
+            f.write(f"Points hist (when HonestBot wins): {stats['points_hist_when_win']}\n")
+            f.write(f"Opponent direct_points on losses (mean/min/max, best-effort): {stats['opp_direct_points_when_loss_best_effort']}\n")
+
+            if not stats["loss_seeds"]:
+                f.write("Losses: 0 ✅\n\n")
+            else:
+                f.write(f"Losses: {len(stats['loss_seeds'])}\n")
+                f.write("Loss seeds:\n")
+                for s in stats["loss_seeds"]:
+                    f.write(f"  - {s}\n")
+                f.write("\nLoss summaries:\n")
+                for line in stats["loss_summaries"]:
+                    f.write("  " + line + "\n")
+                f.write("\n")
+
+        f.write("=" * 80 + "\n")
+        f.write("OVERALL SUMMARY\n")
+        f.write("=" * 80 + "\n")
+        f.write(f"Total: {overall_wins}/{overall_games} ({(overall_wins/overall_games):.2%})\n")
+        f.write(f"Total losses: {overall_losses}\n")
+
+    print("\nDONE.")
+    print(f"Overall: {overall_wins}/{overall_games} ({(overall_wins/overall_games):.2%})")
+    print(f"Wrote report to: {outfile}")
+
+
+
 
 
 def card_str(c: Any) -> str:
