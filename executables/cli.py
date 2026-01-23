@@ -1646,7 +1646,7 @@ def detailed_game_for_seed(seed: int) -> None:
 @main.command()
 def summary_losses():
     """Summary over known seeds – ONLY when HonestBot follows first (second seat)."""
-    seeds = [8, 10, 22, 26, 80, 82, 92, 112, 148, 158, 160, 168, 188]
+    seeds = [188, 232, 667, 702, 714, 764, 932]
     _summarize_losses(seeds)
 
 

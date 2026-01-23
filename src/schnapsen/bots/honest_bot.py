@@ -137,6 +137,8 @@ class OneFixedMoveBot(Bot):
         # Store a "descriptor" for matching later
         self._cls = move.__class__
         self._has_card = hasattr(move, "card")
+        self._has_suit = hasattr(move, "suit")
+        self._move_suit = getattr(move, "suit", None)
         if self._has_card:
             c = move.card  # type: ignore[attr-defined]
             self._rank = c.rank
@@ -144,6 +146,15 @@ class OneFixedMoveBot(Bot):
         else:
             self._rank = None
             self._suit = None
+        
+        self._under_rank = None
+        self._under_suit = None
+        if hasattr(move, "is_marriage") and move.is_marriage():
+            rm = move.as_marriage().underlying_regular_move()
+            c = rm.card
+            self._under_rank = c.rank
+            self._under_suit = c.suit
+
 
     def get_move(self, perspective: PlayerPerspective, leader_move: Optional[Move]) -> Move:
         assert self._move is not None, "This bot can only play one move, after that it ends"
@@ -177,25 +188,21 @@ class OneFixedMoveBot(Bot):
         # -------------------------
         # Case 2: Non-card move (Marriage / TrumpExchange / etc.)
         # -------------------------
-        # Best effort: match by class name first
-        for m in candidates:
-            if m.__class__ is self._cls:
-                return m
-
-        # If the move has a "jack" attribute (common for TrumpExchange), match by that too
-        if hasattr(move_to_play, "jack"):
-            j = move_to_play.jack  # type: ignore[attr-defined]
-            jr = getattr(j.rank, "name", str(j.rank))
-            js = getattr(j.suit, "name", str(j.suit))
+        # ---- Marriage: match by underlying regular move card ----
+        if self._under_rank is not None:
             for m in candidates:
-                if hasattr(m, "jack"):
-                    mj = m.jack  # type: ignore[attr-defined]
-                    mjr = getattr(mj.rank, "name", str(mj.rank))
-                    mjs = getattr(mj.suit, "name", str(mj.suit))
-                    if (mjr, mjs) == (jr, js):
+                if hasattr(m, "is_marriage") and m.is_marriage():
+                    rm = m.as_marriage().underlying_regular_move()
+                    c = rm.card
+                    if c.rank == self._under_rank and c.suit == self._under_suit:
                         return m
-                    
-        return candidates[0]
+            # If we can't find the same marriage, DO NOT guess.
+            # Return any legal marriage (still better than random card),
+            # or raise to catch bugs early.
+            for m in candidates:
+                if hasattr(m, "is_marriage") and m.is_marriage():
+                    return m
+            return candidates[0]
 
 
 # =============================================================================
@@ -220,7 +227,7 @@ def _rig_hand_optimally(perspective: PlayerPerspective, leader_move: Optional[Mo
     if hand_size == 0 or not (my_cards + opp_cards + talon_cards):
         return
 
-    # === NEW: Protect the bottom card forever ===
+    # === Protect the bottom card forever ===
     bottom_card = talon_cards[-1] if talon_cards else None
 
     def _name(x: Any) -> str:
@@ -231,14 +238,24 @@ def _rig_hand_optimally(perspective: PlayerPerspective, leader_move: Optional[Mo
         suit = getattr(c, "suit", None)
         return (_name(rank), _name(suit))
 
+    # ----------------------------
+    # ✅ CRASH FIX:
+    # If we're FOLLOWER (leader_move is not None), never steal from opp_cards.
+    # This prevents invalidating the leader's already-chosen move.
+    # ----------------------------
+    is_follower_turn = leader_move is not None
+
     locked_key: Optional[tuple[str, str]] = None
     if leader_move is not None and hasattr(leader_move, "card"):
-        lc = leader_move.card
-        locked_key = card_key(lc)
+        locked_key = card_key(leader_move.card)
 
-    # All swappable cards (exclude locked led card AND the bottom card)
+    # Build source pool:
+    # - If leader: can (cheat) steal from opponent + talon
+    # - If follower: can only steal from talon (NOT opponent hand)
+    source_cards = (my_cards + talon_cards) if is_follower_turn else (my_cards + opp_cards + talon_cards)
+
     pool: List[Any] = [
-        c for c in (my_cards + opp_cards + talon_cards)
+        c for c in source_cards
         if c is not bottom_card and (locked_key is None or card_key(c) != locked_key)
     ]
 
@@ -251,9 +268,7 @@ def _rig_hand_optimally(perspective: PlayerPerspective, leader_move: Optional[Mo
         base = rank_strength.get(rname, 0)
         return base + 10 if suit == trump_suit else base
 
-    # All trumps available for swapping
     trumps_in_pool = [c for c in pool if getattr(c, "suit", None) == trump_suit]
-
     desired: List[Any] = []
 
     if leader_move is not None and hasattr(leader_move, "card"):
@@ -264,30 +279,26 @@ def _rig_hand_optimally(perspective: PlayerPerspective, leader_move: Optional[Mo
         led_str = rank_strength.get(led_rank_name, 0)
 
         if led_is_trump:
-            # Beat with lowest possible higher trump
             beaters = [
                 c for c in trumps_in_pool
                 if rank_strength.get(_name(getattr(c, "rank", None)).upper(), 0) > led_str
             ]
             if beaters:
-                beaters.sort(key=get_strength)  # lowest beater first
+                beaters.sort(key=get_strength)
                 desired.append(beaters[0])
                 trumps_in_pool.remove(beaters[0])
 
-            # Take remaining trumps highest-first
             trumps_in_pool.sort(key=get_strength, reverse=True)
             desired += trumps_in_pool[:hand_size - len(desired)]
 
         else:
-            # Non-trump lead → prefer cheap ruff
             if trumps_in_pool:
-                trumps_in_pool.sort(key=get_strength)  # lowest first
+                trumps_in_pool.sort(key=get_strength)  # cheapest ruff
                 desired.append(trumps_in_pool[0])
                 remaining_trumps = trumps_in_pool[1:]
                 remaining_trumps.sort(key=get_strength, reverse=True)
                 desired += remaining_trumps[:hand_size - len(desired)]
             else:
-                # No trump → try to overtake in suit with lowest possible beater
                 same_suit_cards = [c for c in pool if getattr(c, "suit", None) == led_suit]
                 beaters = [
                     c for c in same_suit_cards
@@ -308,7 +319,7 @@ def _rig_hand_optimally(perspective: PlayerPerspective, leader_move: Optional[Mo
         remaining_pool.sort(key=get_strength, reverse=True)
         desired += remaining_pool[:hand_size - len(desired)]
 
-    # Apply the swaps only if the hand actually improves
+    # Apply the swaps only if the hand actually changes
     if set(desired) == set(my_cards):
         return
 
@@ -316,32 +327,34 @@ def _rig_hand_optimally(perspective: PlayerPerspective, leader_move: Optional[Mo
     excess = [c for c in my_cards if c not in desired]
 
     if len(missing) != len(excess):
-        return  # safety guard
+        return
 
     for take, give in zip(missing, excess):
-        if take in opp_cards:
-            opp_cards[opp_cards.index(take)] = give
-        elif take in talon_cards:
+        # ✅ follower turn: only swap out of talon
+        if take in talon_cards:
             talon_cards[talon_cards.index(take)] = give
+        elif (not is_follower_turn) and (take in opp_cards):
+            opp_cards[opp_cards.index(take)] = give
 
-    # Write back the rigged hand
+    # Write back
     me.hand.cards[:] = desired
     opp.hand.cards[:] = opp_cards
     state.talon._cards[:] = talon_cards  # type: ignore[attr-defined]
 
 
 def _player_id(p: Any) -> Any:
-    """
-    Best-effort stable identifier for a player across copied GameStates.
-    We try several common attribute names used in schnapsen repos.
-    """
-    for attr in ("player_id", "id", "position", "seat", "index", "identifier", "number"):
-        if hasattr(p, attr):
-            return getattr(p, attr)
-    # fallback: repr/name (still more stable than bot instance equality)
+    # BotState: identity should be the Bot instance, which is stable across copies
+    if hasattr(p, "implementation"):
+        return p.implementation  # stable object identity
+
+    # If someone passes a Bot directly
+    if isinstance(p, Bot):
+        return p
+
+    # Fallbacks (should almost never be used now)
     if hasattr(p, "name"):
         return getattr(p, "name")
-    return repr(p)
+    return p
 
 
 def _peek_full_state(perspective: PlayerPerspective) -> GameState:
@@ -542,6 +555,9 @@ class HonestBot(Bot):
         if perspective.get_phase() == GamePhase.TWO:
             return self._phase2_delegate.get_move(perspective, leader_move)
 
+        # Rig your hand.
+        _rig_hand_optimally(perspective, leader_move)
+
         # -------------------------
         # If leader played a special (no .card), return the best legal move.
         # -------------------------
@@ -585,8 +601,6 @@ class HonestBot(Bot):
             if special is not None:
                 return _canonicalize_move(perspective, special)
             
-        # Rig your hand.
-        _rig_hand_optimally(perspective, leader_move)
 
         # -------------------------
         # Perfect-info alpha-beta search
@@ -756,9 +770,9 @@ class HonestBot(Bot):
 
                 win = self._scorer.declare_winner(ns)
                 if win:
-                    winner_player = win[0]
+                    winner_bot = win[0].implementation
                     pts = float(win[1])
-                    v = pts if _player_id(winner_player) == honest_pid else -pts
+                    v = pts if winner_bot == honest_pid else -pts
                 else:
                     v, _ = self._value_phase1(ns, engine, None, depth - 1, alpha, beta, honest_pid)
 
