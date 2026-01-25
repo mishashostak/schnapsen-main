@@ -135,12 +135,8 @@ class OneFixedMoveBot(Bot):
 
 
 # =============================================================================
-# Phase-1: PERFECT-INFO AlphaBeta (cheats by peeking full GameState)
+# Phase-1: Depth-limited AlphaBeta
 # =============================================================================
-def _peek_full_state(perspective: PlayerPerspective) -> GameState:
-    # Name-mangled private attribute: PlayerPerspective.__game_state
-    return perspective._PlayerPerspective__game_state  # type: ignore[attr-defined]
-
 
 def _get_engine(perspective: PlayerPerspective) -> GamePlayEngine:
     # Most versions expose get_engine()
@@ -206,20 +202,19 @@ class SearchConfig:
 
 class PerfectInfoBot(Bot):
     """
-    Phase 1: perfect-info alpha-beta (cheats by peeking the full GameState)
-    Phase 2: *regular* alpha-beta (no cheating), using the standard AlphaBetaBot logic
+    Phase 1: Depth-limited AlphaBeta
+    Phase 2: *regular* alpha-beta, using the standard AlphaBetaBot logic
     """
 
     def __init__(self, name: Optional[str] = None, config: SearchConfig = SearchConfig()) -> None:
         super().__init__(name=name)
         self.config = config
         self._phase2_delegate = AlphaBetaBot(name=None)
-        # rigging control
-        self._rigged_once = False
+
 
     def get_move(self, perspective: PlayerPerspective, leader_move: Optional[Move]) -> Move:
         if perspective.get_phase() == GamePhase.TWO:
-            # Switch to regular phase-2 alpha-beta (no peeking)
+            # Switch to regular phase-2 alpha-beta 
             return self._phase2_delegate.get_move(perspective, leader_move)
 
         engine = _get_engine(perspective)
@@ -332,7 +327,3 @@ class PerfectInfoBot(Bot):
 
         assert best_move is not None
         return best_value, best_move
-
-    def notify_game_end(self, won: bool, perspective: PlayerPerspective) -> None:
-        # Reset so the next game can rig again
-        self._rigged_once = False
