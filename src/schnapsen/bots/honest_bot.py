@@ -137,8 +137,6 @@ class OneFixedMoveBot(Bot):
         # Store a "descriptor" for matching later
         self._cls = move.__class__
         self._has_card = hasattr(move, "card")
-        self._has_suit = hasattr(move, "suit")
-        self._move_suit = getattr(move, "suit", None)
         if self._has_card:
             c = move.card  # type: ignore[attr-defined]
             self._rank = c.rank
@@ -146,14 +144,6 @@ class OneFixedMoveBot(Bot):
         else:
             self._rank = None
             self._suit = None
-        
-        self._under_rank = None
-        self._under_suit = None
-        if hasattr(move, "is_marriage") and move.is_marriage():
-            rm = move.as_marriage().underlying_regular_move()
-            c = rm.card
-            self._under_rank = c.rank
-            self._under_suit = c.suit
 
 
     def get_move(self, perspective: PlayerPerspective, leader_move: Optional[Move]) -> Move:
@@ -188,21 +178,25 @@ class OneFixedMoveBot(Bot):
         # -------------------------
         # Case 2: Non-card move (Marriage / TrumpExchange / etc.)
         # -------------------------
-        # ---- Marriage: match by underlying regular move card ----
-        if self._under_rank is not None:
+        # Best effort: match by class name first
+        for m in candidates:
+            if m.__class__ is self._cls:
+                return m
+
+        # If the move has a "jack" attribute (common for TrumpExchange), match by that too
+        if hasattr(move_to_play, "jack"):
+            j = move_to_play.jack  # type: ignore[attr-defined]
+            jr = getattr(j.rank, "name", str(j.rank))
+            js = getattr(j.suit, "name", str(j.suit))
             for m in candidates:
-                if hasattr(m, "is_marriage") and m.is_marriage():
-                    rm = m.as_marriage().underlying_regular_move()
-                    c = rm.card
-                    if c.rank == self._under_rank and c.suit == self._under_suit:
+                if hasattr(m, "jack"):
+                    mj = m.jack  # type: ignore[attr-defined]
+                    mjr = getattr(mj.rank, "name", str(mj.rank))
+                    mjs = getattr(mj.suit, "name", str(mj.suit))
+                    if (mjr, mjs) == (jr, js):
                         return m
-            # If we can't find the same marriage, DO NOT guess.
-            # Return any legal marriage (still better than random card),
-            # or raise to catch bugs early.
-            for m in candidates:
-                if hasattr(m, "is_marriage") and m.is_marriage():
-                    return m
-            return candidates[0]
+                    
+        return candidates[0]
 
 
 # =============================================================================
