@@ -1496,9 +1496,6 @@ def hb2_tournament(
     print(f"Wrote report to: {outfile}")
 
 
-
-
-
 def card_str(c: Any) -> str:
     rank_name = getattr(getattr(c, "rank", None), "name", str(getattr(c, "rank", ""))).upper()
     suit_name = getattr(getattr(c, "suit", None), "name", str(getattr(c, "suit", ""))).upper()
@@ -1574,7 +1571,7 @@ def detailed_game_for_seed(seed: int) -> None:
     engine = SchnapsenGamePlayEngine()
 
     # Exact internal randomness for RDeep
-    rdeep_rand = random.Random(999999)
+    rdeep_rand = random.Random(99999 + seed)
 
     honest = HonestBot(name="HonestBot")
     rdeep = RdeepBot(num_samples=16, depth=4, rand=rdeep_rand)
@@ -1691,7 +1688,7 @@ def detailed_game_for_seed_as_leader(seed: int) -> None:
     engine = SchnapsenGamePlayEngine()
 
     # Exact internal randomness for RDeep
-    rdeep_rand = random.Random(999999)
+    rdeep_rand = random.Random(99999 + seed)
 
     honest = HonestBot(name="HonestBot")
     rdeep = RdeepBot(num_samples=16, depth=4, rand=rdeep_rand)
