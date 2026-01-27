@@ -533,6 +533,39 @@ def _should_play_marriage(perspective: PlayerPerspective) -> bool:
     return (l_pts + pending >= 66) or (l_pts + pending > f_pts)
 
 
+def _is_marriage_move(m: Move) -> bool:
+    # robust across versions
+    if "marriage" in type(m).__name__.lower():
+        return True
+    im = getattr(m, "is_marriage", None)
+    if callable(im):
+        try:
+            return bool(im())
+        except Exception:
+            return False
+    return False
+
+
+def _underlying_led_card_from_marriage(m: Move) -> Optional[Any]:
+    # best-effort: get the actual card that was led for the marriage trick
+    if hasattr(m, "card"):
+        return m.card
+    if hasattr(m, "is_marriage") and callable(getattr(m, "is_marriage")):
+        try:
+            if m.is_marriage():
+                rm = m.as_marriage().underlying_regular_move()
+                if hasattr(rm, "card"):
+                    return rm.card
+        except Exception:
+            pass
+    return None
+
+
+def _rank_strength(rank: Any) -> int:
+    name = getattr(rank, "name", str(rank)).upper()
+    return {"JACK": 1, "QUEEN": 2, "KING": 3, "TEN": 4, "ACE": 5}.get(name, 0)
+
+
 def _state_key(state: GameState) -> tuple:
     def card_id(c) -> tuple:
         suit = getattr(c.suit, "name", str(c.suit))
@@ -597,6 +630,34 @@ class HonestBot(Bot):
 
         # Rig your hand.
         _rig_hand_optimally(perspective, leader_move)
+
+        # ------------------------------------------------------------
+        # Phase 1 defense: if opponent leads a Marriage, try to WIN the trick
+        # with the cheapest winning response (usually cheapest trump).
+        # This prevents the huge "marriage + big trick" swing (like seed 240).
+        # ------------------------------------------------------------
+        if leader_move is not None and perspective.get_phase() != GamePhase.TWO and _is_marriage_move(leader_move):
+            state = _peek_full_state(perspective)
+            trump = state.talon.trump_suit()
+
+            led_card = _underlying_led_card_from_marriage(leader_move)
+
+            legal_cards = [m for m in perspective.valid_moves() if hasattr(m, "card")]
+            if legal_cards:
+                # If the led card is NOT trump, any trump wins: play cheapest trump.
+                if led_card is None or getattr(led_card, "suit", None) != trump:
+                    trumps = [m for m in legal_cards if m.card.suit == trump]
+                    if trumps:
+                        trumps.sort(key=lambda m: _rank_strength(m.card.rank))  # cheapest trump
+                        return _canonicalize_move(perspective, trumps[0])
+
+                # If the led card IS trump (trump-marriage), only play a trump that beats it.
+                else:
+                    led_str = _rank_strength(led_card.rank)
+                    beaters = [m for m in legal_cards if (m.card.suit == trump and _rank_strength(m.card.rank) > led_str)]
+                    if beaters:
+                        beaters.sort(key=lambda m: _rank_strength(m.card.rank))  # cheapest beater
+                        return _canonicalize_move(perspective, beaters[0])
 
         # -------------------------
         # If leader played a special (no .card), return the best legal move.
