@@ -1,5 +1,10 @@
 # Schnapsen platform - Project Intelligent Systems 2024-2025
 
+## Important Info (FOR PEER REVIEWERS)
+The final most important bot's code is in honest_bot.py. 
+
+All commands used for testing are laid out in the cli.py docstring.
+
 ## Getting started
 
 This is a platform for the schnapsen card game. To get to know the concept of the game, please visit
