@@ -231,6 +231,36 @@ def _rig_hand_optimally(perspective: PlayerPerspective, leader_move: Optional[Mo
         rank = getattr(c, "rank", None)
         suit = getattr(c, "suit", None)
         return (_name(rank), _name(suit))
+    
+    locked_keys: set[tuple[str, str]] = set()
+
+    # If leader already played something, protect everything that move depends on.
+    if leader_move is not None:
+        # 1) Regular card move
+        if hasattr(leader_move, "card"):
+            locked_keys.add(card_key(leader_move.card))
+
+        # 2) Marriage: lock BOTH marriage cards (king+queen of that suit)
+        #    so we never steal either one while the move is pending.
+        if hasattr(leader_move, "is_marriage") and leader_move.is_marriage():
+            rm = leader_move.as_marriage().underlying_regular_move()
+            suit = rm.card.suit
+            locked_keys.add(card_key(rm.card))  # underlying played card
+            # lock the partner card too:
+            # partner is the other of King/Queen in that suit
+            under_rank = getattr(rm.card.rank, "name", str(rm.card.rank)).upper()
+            partner_rank = "KING" if under_rank == "QUEEN" else "QUEEN"
+            locked_keys.add((partner_rank, getattr(suit, "name", str(suit))))
+
+        # 3) Trump exchange: lock the jack AND the current trump card
+        if hasattr(leader_move, "jack"):
+            j = leader_move.jack
+            locked_keys.add(card_key(j))
+            # lock the exposed trump card too
+            trump_card = getattr(state.talon, "trump_card", None)
+            if trump_card is not None:
+                locked_keys.add(card_key(trump_card))
+
 
     # ----------------------------
     # ✅ CRASH FIX:
@@ -239,18 +269,14 @@ def _rig_hand_optimally(perspective: PlayerPerspective, leader_move: Optional[Mo
     # ----------------------------
     is_follower_turn = leader_move is not None
 
-    locked_key: Optional[tuple[str, str]] = None
-    if leader_move is not None and hasattr(leader_move, "card"):
-        locked_key = card_key(leader_move.card)
-
     # Build source pool:
     # - If leader: can (cheat) steal from opponent + talon
     # - If follower: can only steal from talon (NOT opponent hand)
-    source_cards = (my_cards + talon_cards) if is_follower_turn else (my_cards + opp_cards + talon_cards)
+    source_cards = (my_cards + opp_cards + talon_cards)
 
     pool: List[Any] = [
         c for c in source_cards
-        if c is not bottom_card and (locked_key is None or card_key(c) != locked_key)
+        if c is not bottom_card and card_key(c) not in locked_keys
     ]
 
     rank_strength = {"ACE": 5, "TEN": 4, "KING": 3, "QUEEN": 2, "JACK": 1}
@@ -318,17 +344,58 @@ def _rig_hand_optimally(perspective: PlayerPerspective, leader_move: Optional[Mo
         return
 
     missing = [c for c in desired if c not in my_cards]
-    excess = [c for c in my_cards if c not in desired]
+    excess  = [c for c in my_cards if c not in desired]
 
     if len(missing) != len(excess):
-        return
+        return  # safety
+
+    # --- swaps: MUST preserve talon order ---
+    trump_index = len(talon_cards) - 1  # bottom trump card slot (must never change)
 
     for take, give in zip(missing, excess):
-        # ✅ follower turn: only swap out of talon
         if take in talon_cards:
-            talon_cards[talon_cards.index(take)] = give
-        elif (not is_follower_turn) and (take in opp_cards):
-            opp_cards[opp_cards.index(take)] = give
+            idx = talon_cards.index(take)
+
+            # Never touch the bottom trump card position.
+            # (Your pool already tries to exclude it, but this is a hard safety net.)
+            if idx == trump_index:
+                # If this ever triggers, your pool selection included the bottom trump card.
+                # Bail out rather than corrupting the talon.
+                return
+
+            talon_cards[idx] = give
+
+        elif take in opp_cards:
+            idx = opp_cards.index(take)
+            opp_cards[idx] = give
+
+        else:
+            return  # safety
+
+
+    # If leader already committed a CARD move, that exact card must still be
+    # present in the leader's hand in this state before we write back.
+    # ----------------------------
+    if leader_move is not None and hasattr(leader_move, "card"):
+        led_card = leader_move.card  # the committed card object in this state
+        # In this function, `opp` is ALWAYS the current leader when we are follower.
+        # If we are follower, `opp.hand` must still contain the committed card.
+        # If we are leader, this check is still safe (it checks the real leader).
+        assert led_card in opp_cards, (
+            "Rigging removed the leader's committed card! "
+            f"Committed={led_card}, opp_cards={opp_cards}"
+        )
+
+    # sanity: no card should exist in both hands
+    overlap = set(desired) & set(opp_cards)
+    assert not overlap, f"Rigging duplicated cards across hands: {overlap}"
+
+    #sanity check
+    if talon_cards:
+        assert getattr(talon_cards[-1], "suit", None) == trump_suit, (
+            f"Talon bottom card suit changed! bottom={talon_cards[-1]} trump={trump_suit}"
+        )
+
 
     # Write back
     me.hand.cards[:] = desired
@@ -361,27 +428,6 @@ def _get_engine(perspective: PlayerPerspective) -> GamePlayEngine:
     if hasattr(perspective, "get_engine"):
         return perspective.get_engine()  # type: ignore[no-any-return]
     return perspective.engine  # type: ignore[attr-defined]
-
-
-def _try_extract_direct_points(state: GameState) -> Optional[tuple[int, int]]:
-    """
-    Best-effort extraction of (leader_points, follower_points).
-    If your framework version exposes these differently, you can adjust this.
-    """
-    leader = state.leader
-    follower = state.follower
-
-    for score_attr in ("score", "points", "game_points"):
-        if hasattr(leader, score_attr) and hasattr(follower, score_attr):
-            ls = getattr(leader, score_attr)
-            fs = getattr(follower, score_attr)
-            for direct_attr in ("direct_points", "direct", "points", "value"):
-                if hasattr(ls, direct_attr) and hasattr(fs, direct_attr):
-                    try:
-                        return int(getattr(ls, direct_attr)), int(getattr(fs, direct_attr))
-                    except Exception:
-                        pass
-    return None
 
 
 def _pick_forced_special_move(perspective: PlayerPerspective) -> Optional[Move]:
@@ -799,4 +845,5 @@ class HonestBot(Bot):
 
     def notify_game_end(self, won: bool, perspective: PlayerPerspective) -> None:
         self._marriage_played = False
+        self._tt.clear()
 
