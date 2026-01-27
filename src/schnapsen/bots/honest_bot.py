@@ -375,6 +375,19 @@ def _rig_hand_optimally(perspective: PlayerPerspective, leader_move: Optional[Mo
 
         else:
             return  # safety
+        
+    # Extra safety for Marriage moves even when they don't expose `.card`
+    if leader_move is not None:
+        try:
+            if hasattr(leader_move, "is_marriage") and leader_move.is_marriage():
+                rm = leader_move.as_marriage().underlying_regular_move()
+                suit = rm.card.suit
+                needed = {("KING", getattr(suit, "name", str(suit))), ("QUEEN", getattr(suit, "name", str(suit)))}
+                have = {(getattr(c.rank, "name", str(c.rank)).upper(), getattr(c.suit, "name", str(c.suit))) for c in opp_cards}
+                assert needed.issubset(have), f"Rigging broke a committed marriage: needed={needed}, have={have}"
+        except Exception:
+            # If the API differs, safest fallback is to avoid opponent stealing while follower
+            return
 
 
     # If leader already committed a CARD move, that exact card must still be
@@ -627,9 +640,10 @@ class HonestBot(Bot):
 
     def get_move(self, perspective: PlayerPerspective, leader_move: Optional[Move]) -> Move:
         # -------------------------
-        # Phase 2: no cheating
+        # Phase 2: Rigs hand then goes into regular alpha-beta bot
         # -------------------------
         if perspective.get_phase() == GamePhase.TWO:
+            _rig_hand_optimally(perspective, leader_move)
             return self._phase2_delegate.get_move(perspective, leader_move)
 
         # Rig your hand.
