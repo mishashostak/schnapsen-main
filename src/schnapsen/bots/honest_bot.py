@@ -17,7 +17,7 @@ from schnapsen.game import (
 
 
 # =============================================================================
-# Phase-2: REGULAR AlphaBeta (no cheating) — identical strategy to alphabeta.py
+# Phase-2: REGULAR AlphaBeta (no cheating) — based on the standard alphabeta.py approach
 # =============================================================================
 
 class AlphaBetaBot(Bot):
@@ -261,17 +261,21 @@ def _rig_hand_optimally(perspective: PlayerPerspective, leader_move: Optional[Mo
             if trump_card is not None:
                 locked_keys.add(card_key(trump_card))
 
-
     # ----------------------------
-    # ✅ CRASH FIX:
-    # If we're FOLLOWER (leader_move is not None), never steal from opp_cards.
-    # This prevents invalidating the leader's already-chosen move.
+    # SAFETY NOTE:
+    # If the leader has already committed a move (leader_move is not None), we must NOT
+    # invalidate that move by stealing/modifying any cards it depends on. We enforce this
+    # by locking the leader's committed card(s) (and any special-move dependencies) via `locked_keys`.
+    #
+    # If you want a stricter (and simpler) policy: "when follower, only swap with the talon",
+    # change `source_cards` below to `my_cards + talon_cards`.
     # ----------------------------
-    is_follower_turn = leader_move is not None
 
     # Build source pool:
-    # - If leader: can (cheat) steal from opponent + talon
-    # - If follower: can only steal from talon (NOT opponent hand)
+    # - We always consider (my + opponent + talon) cards, but we exclude any locked cards
+    #   (e.g., the leader’s committed card / marriage partner / trump-exchange dependencies).
+    # - If you want to forbid stealing from the opponent while following, use:
+    #     source_cards = my_cards + talon_cards
     source_cards = (my_cards + opp_cards + talon_cards)
 
     pool: List[Any] = [
@@ -632,9 +636,10 @@ class HonestBot(Bot):
         _rig_hand_optimally(perspective, leader_move)
 
         # ------------------------------------------------------------
-        # Phase 1 defense: if opponent leads a Marriage, try to WIN the trick
-        # with the cheapest winning response (usually cheapest trump).
-        # This prevents the huge "marriage + big trick" swing (like seed 240).
+        # Phase 1 defense: if opponent leads a Marriage, attempt to win the trick
+        # with the cheapest available winning response (often the cheapest trump).
+        # If no winning response exists, fall back to normal search.
+        # This reduces high-variance "marriage + big trick" swings (e.g., seed 240).
         # ------------------------------------------------------------
         if leader_move is not None and perspective.get_phase() != GamePhase.TWO and _is_marriage_move(leader_move):
             state = _peek_full_state(perspective)

@@ -1,3 +1,142 @@
+"""
+HonestBot testing / evaluation CLI (Click)
+=========================================
+
+This file provides Click commands to run reproducible experiments and debug runs for
+HonestBot and the earlier HB0/HB1/HB2 variants. The commands below are the *main*
+entry points a user should run to reproduce win-rates, generate reports, and inspect
+problematic seeds.
+
+Run pattern
+-----------
+From the repo root, run commands like:
+
+    python executables/cli.py <command> [options]
+
+Use:
+
+    python executables/cli.py --help
+    python executables/cli.py <command> --help
+
+to see available commands and options.
+
+
+===============================================================================
+Core match runner (HonestBot vs RDeep)
+===============================================================================
+
+honest-vs-rdeep
+    Runs HonestBot vs RdeepBot for a fixed number of games, alternating seats every game,
+    printing progress, and writing a loss-only report.
+
+    Options:
+    --games INTEGER
+        Number of games to play total. Default: 200
+    --seed0 INTEGER
+        Starting seed. Game i uses seed = seed0 + i. Default: 1
+    --rdeep-samples INTEGER
+        RdeepBot rollout samples per decision. Default: 16
+    --rdeep-depth INTEGER
+        RdeepBot rollout depth. Default: 4
+    --progress-every INTEGER
+        Print progress every N games. Default: 5
+    --outfile TEXT
+        Output filename for loss-only lines. Default: honest_vs_rdeep_report.txt
+
+    Example:
+        python executables/cli.py honest-vs-rdeep --games 500 --seed0 1 --outfile hvrd.txt
+
+
+===============================================================================
+Multi-opponent tournament (HonestBot)
+===============================================================================
+
+honestbot-tournament
+    Runs three blocks of matchups, each with seat alternation:
+        1) HonestBot vs RdeepBot
+        2) HonestBot vs BullyBot
+        3) HonestBot vs RandBot
+
+    Produces a report file containing winrates per opponent and (if any) loss seeds and
+    short summaries.
+
+    Options:
+    --games INTEGER
+        Games *per opponent*. Default: 1000
+    --seed0 INTEGER
+        Starting seed for the first block. Default: 1
+        NOTE: The implementation advances an internal seed cursor between blocks, so each
+        opponent block uses a different contiguous seed range.
+    --outfile TEXT
+        Output report filename. Default: honest_tournament_report.txt
+    --rdeep-samples INTEGER
+        RdeepBot rollout samples. Default: 16
+    --rdeep-depth INTEGER
+        RdeepBot rollout depth. Default: 4
+
+    Example:
+        python executables/cli.py honestbot-tournament --games 1000 --seed0 1 --outfile tourney.txt
+
+
+===============================================================================
+Baseline tournaments (HB0 / HB1 / HB2)
+===============================================================================
+
+hb0-tournament
+HB1-tournament
+HB2-tournament
+    These commands mirror `honestbot-tournament`, but swap the tested bot:
+        - hb0-tournament uses HB0 (from schnapsen.bots.HB0)
+        - hb1-tournament uses HB1 (from schnapsen.bots.HB1)
+        - hb2-tournament uses HB2 (from schnapsen.bots.HB2)
+
+    Options (same meaning as HonestBot tournament):
+    --games INTEGER            Default: 1000
+    --seed0 INTEGER            Default: 1
+    --outfile TEXT             Default: HB0_report.txt / HB1_report.txt / HB2_report.txt
+    --rdeep-samples INTEGER    Default: 16
+    --rdeep-depth INTEGER      Default: 4
+
+    Example:
+        python executables/cli.py hb0-tournament --games 1000 --seed0 1 --outfile hb0.txt
+        python executables/cli.py HB1-tournament --games 1000 --seed0 1 --outfile hb1.txt
+        python executables/cli.py HB2-tournament --games 1000 --seed0 1 --outfile hb2.txt
+
+        
+===============================================================================
+Seed debugging (full trick-by-trick logs)
+===============================================================================
+
+summary-losses
+    Replays a fixed list of “known problematic” seeds where HonestBot is forced into the
+    second seat (follows first) and prints whether they still lose.
+
+    Usage:
+        python executables/cli.py summary-losses
+
+
+debug-seed --seed INTEGER
+    Prints a full trick-by-trick game log for a single seed with fixed seating:
+    HonestBot is second seat (RDeep leads first). Useful to diagnose specific losses.
+
+    Required option:
+    --seed INTEGER
+
+    Example:
+        python executables/cli.py debug-seed --seed 240
+
+
+debug-seed-as-leader --seed INTEGER
+    Same style of full log, but HonestBot is first seat (leads first).
+
+    Required option:
+    --seed INTEGER
+
+    Example:
+        python executables/cli.py debug-seed-as-leader --seed 240
+"""
+
+
 import random
 import pathlib
 
@@ -44,101 +183,6 @@ def play_games_and_return_stats(engine: GamePlayEngine, bot1: Bot, bot2: Bot, pa
         if game_pair > 0 and (game_pair + 1) % 500 == 0:
             print(f"Progress: {game_pair + 1}/{pairs_of_games} game pairs played")
     return bot1_wins
-
-
-@main.command()
-@click.option("--games", default=200, show_default=True, type=int)
-@click.option("--seed0", default=1, show_default=True, type=int)
-@click.option("--rdeep-samples", default=16, show_default=True, type=int)
-@click.option("--rdeep-depth", default=4, show_default=True, type=int)
-@click.option("--progress-every", default=5, show_default=True, type=int)
-@click.option("--outfile", default="legacy_report.txt", show_default=True, type=str)
-def legacy(
-    games: int,
-    seed0: int,
-    rdeep_samples: int,
-    rdeep_depth: int,
-    progress_every: int,
-    outfile: str,
-) -> None:
-    """
-    HonestBot vs RdeepBot.
-    - Alternates seats every game.
-    - Fresh bots each game (no state leakage).
-    - Clean progress printing (exactly once).
-    - Full loss summaries written to outfile.
-    """
-
-    import time
-    import random
-    from typing import List, Tuple
-    from schnapsen.bots.HB2 import PerfectInfoBot
-
-    engine = SchnapsenGamePlayEngine()
-
-    # Import your bot class (adjust path if needed)
-    # from schnapsen.bots.honestbot import HonestBot
-    # If HonestBot is defined in this same cli.py, then just use it directly.
-
-    wins = 0
-    losses: List[Tuple[int, str]] = []
-
-    t0 = time.time()
-
-    with open(outfile, "w", encoding="utf-8") as f:
-        f.write("HONEST VS RDEEP REPORT\n")
-        f.write(f"games={games} seed0={seed0}\n")
-        f.write(f"rdeep_samples={rdeep_samples} rdeep_depth={rdeep_depth}\n\n")
-
-        for i in range(games):
-            seed = seed0 + i
-            rng = random.Random(seed)
-
-            # Fresh bots each game
-            honest = PerfectInfoBot(name="perf/honest")  # <-- your renamed bot
-            rdeep = RdeepBot(
-                num_samples=rdeep_samples,
-                depth=rdeep_depth,
-                rand=random.Random(99999 + seed),
-            )
-
-            # Alternate seats every game:
-            # odd games: Honest is bot1 (leader at start)
-            # even games: Honest is bot2
-            if (i % 2) == 0:
-                bot1, bot2 = honest, rdeep
-                seats = "H-first"
-            else:
-                bot1, bot2 = rdeep, honest
-                seats = "H-second"
-
-            winner, game_points, score = engine.play_game(bot1, bot2, rng)
-
-            honest_won = (winner == honest)
-            if honest_won:
-                wins += 1
-            else:
-                # Keep a compact loss line (don’t spam stdout)
-                line = f"LOSS seed={seed} seats={seats} winner={winner} game_points={game_points} score={score}"
-                losses.append((seed, line))
-                f.write(line + "\n")
-
-            # Progress printing EXACTLY ONCE
-            if progress_every > 0 and ((i + 1) % progress_every == 0 or (i + 1) == games):
-                print(f"Progress {i+1}/{games} | wins={wins} | winrate={wins/(i+1):.1%}")
-
-        runtime = time.time() - t0
-        f.write("\n")
-        f.write(f"SUMMARY wins={wins}/{games} ({wins/games:.2%})\n")
-        f.write(f"runtime_seconds={runtime:.2f}\n")
-        f.write(f"losses={len(losses)}\n")
-        if losses:
-            f.write("loss_seeds:\n")
-            for s, _ in losses:
-                f.write(f"  - {s}\n")
-
-    print(f"\nDONE. Wins={wins}/{games} ({wins/games:.2%})")
-    print(f"Wrote report to: {outfile}")
 
 
 @main.command()
@@ -850,7 +894,7 @@ def hb0_tournament(
 @click.option("--outfile", default="HB1_report.txt", show_default=True, type=str)
 @click.option("--rdeep-samples", default=16, show_default=True, type=int)
 @click.option("--rdeep-depth", default=4, show_default=True, type=int)
-def HB1_tournament(
+def hb1_tournament(
     games: int,
     seed0: int,
     outfile: str,
@@ -1155,7 +1199,7 @@ def HB1_tournament(
 @click.option("--outfile", default="HB2_report.txt", show_default=True, type=str)
 @click.option("--rdeep-samples", default=16, show_default=True, type=int)
 @click.option("--rdeep-depth", default=4, show_default=True, type=int)
-def HB2_tournament(
+def hb2_tournament(
     games: int,
     seed0: int,
     outfile: str,
@@ -1643,6 +1687,123 @@ def detailed_game_for_seed(seed: int) -> None:
             break
 
 
+def detailed_game_for_seed_as_leader(seed: int) -> None:
+    engine = SchnapsenGamePlayEngine()
+
+    # Exact internal randomness for RDeep
+    rdeep_rand = random.Random(999999)
+
+    honest = HonestBot(name="HonestBot")
+    rdeep = RdeepBot(num_samples=16, depth=4, rand=rdeep_rand)
+
+    rng = random.Random(seed)
+
+    # Manual initial state
+    deck = engine.deck_generator.get_initial_deck()
+    shuffled = engine.deck_generator.shuffle_deck(deck, rng)
+    leader_hand, follower_hand, talon = engine.hand_generator.generateHands(shuffled)
+
+    # RDeep ALWAYS second
+    leader_state = BotState(implementation=honest, hand=leader_hand)
+    follower_state = BotState(implementation=rdeep, hand=follower_hand)
+
+    game_state = GameState(
+        leader=leader_state,
+        follower=follower_state,
+        talon=talon,
+        previous=None,
+    )
+
+    print(f"\n{'='*80}")
+    print(f"DETAILED LOG – SEED {seed} | HonestBot LEADS FIRST (first seat)")
+    print(f"{'='*80}")
+
+    trick_number = 1
+    while True:
+        trump_suit = game_state.trump_suit
+        trump_name = getattr(trump_suit, "name", str(trump_suit)).upper()
+
+        honest_is_leader = game_state.leader.implementation is honest
+
+        honest_hand = game_state.leader.hand if honest_is_leader else game_state.follower.hand
+        rdeep_hand = game_state.follower.hand if honest_is_leader else game_state.leader.hand
+
+        honest_direct = game_state.leader.score.direct_points if honest_is_leader else game_state.follower.score.direct_points
+        honest_pending = game_state.leader.score.pending_points if honest_is_leader else game_state.follower.score.pending_points
+        rdeep_direct = game_state.follower.score.direct_points if honest_is_leader else game_state.leader.score.direct_points
+        rdeep_pending = game_state.follower.score.pending_points if honest_is_leader else game_state.leader.score.pending_points
+
+        talon_size = len(game_state.talon._cards)
+
+        print(f"\n--- Trick {trick_number} | Trump: {trump_name} | Talon: {talon_size} cards ---")
+        print(f"Leader: {'HonestBot' if honest_is_leader else 'RDeepBot'}")
+        print(f"Scores → HonestBot: {honest_direct} (pending: {honest_pending}) | RDeepBot: {rdeep_direct} (pending: {rdeep_pending})")
+        print(f"HonestBot hand: {sorted_hand_str(honest_hand.cards, trump_suit)}")
+        print(f"RDeepBot  hand: {sorted_hand_str(rdeep_hand.cards, trump_suit)}")
+
+        leader_perspective = LeaderPerspective(game_state, engine)
+        leader_move = game_state.leader.implementation.get_move(leader_perspective, None)
+        print(f"Leader plays → {move_str(leader_move)}")
+
+        if leader_move.is_trump_exchange():
+            print("→ Trump Exchange – trick ends (leader remains leader)")
+            new_game_state = engine.trick_implementer.play_trick_with_fixed_leader_move(
+                engine, game_state, leader_move
+            )
+
+        else:
+            follower_perspective = FollowerPerspective(game_state, engine, leader_move)
+            follower_move = game_state.follower.implementation.get_move(follower_perspective, leader_move)
+            print(f"Follower plays → {move_str(follower_move)}")
+
+            if leader_move.is_marriage():
+                leader_card = leader_move.underlying_regular_move().card
+            else:
+                leader_card = leader_move.card
+            follower_card = follower_move.card
+
+            scorer = SchnapsenTrickScorer()
+            leader_pts = scorer.rank_to_points(leader_card.rank)
+            follower_pts = scorer.rank_to_points(follower_card.rank)
+            card_points = leader_pts + follower_pts
+
+            if leader_card.suit == follower_card.suit:
+                leader_wins = leader_pts > follower_pts
+            elif leader_card.suit == trump_suit:
+                leader_wins = True
+            elif follower_card.suit == trump_suit:
+                leader_wins = False
+            else:
+                leader_wins = True
+
+            winner_name = "Leader" if leader_wins else "Follower"
+            print(f"→ Trick won by {winner_name} (+{card_points} card points)")
+
+            new_game_state = engine.trick_implementer.play_trick_with_fixed_leader_move(
+                engine, game_state, leader_move
+            )
+
+        if talon_size > 0 and len(new_game_state.talon._cards) < talon_size:
+            print(f"→ Cards drawn from talon (winner takes first)")
+
+        game_state = new_game_state
+        trick_number += 1
+
+        winning_info = engine.trick_scorer.declare_winner(game_state)
+        if winning_info:
+            winner_botstate, game_points = winning_info
+            winner_name = "HonestBot" if winner_botstate.implementation is honest else "RDeepBot"
+
+            final_honest = honest_direct + honest_pending if honest_is_leader else (game_state.follower.score.direct_points + game_state.follower.score.pending_points)
+            final_rdeep = rdeep_direct + rdeep_pending if honest_is_leader else (game_state.leader.score.direct_points + game_state.leader.score.pending_points)
+
+            print(f"\n{'='*80}")
+            print(f"GAME OVER – {winner_name} wins ({game_points} game points)!")
+            print(f"Final card points → HonestBot: {final_honest} | RDeepBot: {final_rdeep}")
+            print(f"{'='*80}")
+            break
+
+
 @main.command()
 def summary_losses():
     """Summary over known seeds – ONLY when HonestBot follows first (second seat)."""
@@ -1656,170 +1817,11 @@ def debug_seed(seed: int):
     """Full trick-by-trick log – ONLY when HonestBot follows first (second seat)."""
     detailed_game_for_seed(seed)
 
-
 @main.command()
-@click.option("--games", default=200, show_default=True, type=int, help="How many games to play")
-@click.option("--seed0", default=1, show_default=True, type=int, help="First seed used for random.Random(seed)")
-@click.option("--rdeep-samples", default=16, show_default=True, type=int)
-@click.option("--rdeep-depth", default=4, show_default=True, type=int)
-@click.option("--outfile", default="loss_report.txt", show_default=True, type=str)
-def honest_diagnose(games: int, seed0: int, rdeep_samples: int, rdeep_depth: int, outfile: str) -> None:
-    """
-    HonestBot vs RdeepBot with LOSS logging:
-    - Swaps seats every other game (like honest_vs_rdeep)
-    - Reuses the SAME bot instances across all games (like a tournament)
-    - Uses the same per-game RNG seeding style as honest_vs_rdeep (random.Random(game_number))
-    - Only logs losses to outfile
-    """
-
-    engine = SchnapsenGamePlayEngine()
-
-    # --- helper for readable move text ---
-    def _move_to_str(m: Optional[Move]) -> str:
-        if m is None:
-            return "-"
-        t = type(m).__name__
-        if hasattr(m, "card"):
-            c = m.card  # type: ignore[attr-defined]
-            r = getattr(c.rank, "name", str(c.rank))
-            s = getattr(c.suit, "name", str(c.suit))
-            return f"{t}({r}_{s})"
-        if hasattr(m, "jack"):
-            j = m.jack  # type: ignore[attr-defined]
-            r = getattr(j.rank, "name", str(j.rank))
-            s = getattr(j.suit, "name", str(j.suit))
-            return f"{t}(jack={r}_{s})"
-        return t
-
-    # --- Logging wrapper bot (same idea as before) ---
-    class LoggingBot(Bot):
-        """
-        Wraps a Bot and records (phase, talon_len, leader_move?, chosen_move, scores if accessible).
-        """
-        def __init__(self, inner: Bot, label: str):
-            super().__init__(name=f"{label}")
-            self.inner = inner
-            self.label = label
-            self.log: List[str] = []
-
-        def reset_log(self) -> None:
-            self.log = []
-
-        def get_move(self, perspective: PlayerPerspective, leader_move: Optional[Move]) -> Move:
-            mv = self.inner.get_move(perspective, leader_move)
-
-            # Gather cheap state info
-            try:
-                phase = perspective.get_phase()
-            except Exception:
-                phase = "?"
-
-            try:
-                st = perspective._PlayerPerspective__game_state  # type: ignore[attr-defined]
-                talon_len = len(getattr(st.talon, "_cards", []))
-            except Exception:
-                talon_len = "?"
-
-            # Try to read scores (best-effort)
-            ldp = fdp = lpp = fpp = "?"
-            try:
-                st = perspective._PlayerPerspective__game_state  # type: ignore[attr-defined]
-                ldp = getattr(st.leader.score, "direct_points", "?")
-                fdp = getattr(st.follower.score, "direct_points", "?")
-                lpp = getattr(st.leader.score, "pending_points", "?")
-                fpp = getattr(st.follower.score, "pending_points", "?")
-            except Exception:
-                pass
-
-            lm_str = _move_to_str(leader_move) if leader_move is not None else "-"
-            mv_str = _move_to_str(mv)
-
-            self.log.append(
-                f"[{self.label}] phase={phase} talon={talon_len} "
-                f"score(L:{ldp}+{lpp}, F:{fdp}+{fpp}) "
-                f"leader_move={lm_str} -> move={mv_str}"
-            )
-            return mv
-
-        def notify_game_end(self, won: bool, perspective: PlayerPerspective) -> None:
-            if hasattr(self.inner, "notify_game_end"):
-                self.inner.notify_game_end(won, perspective)
-
-        def notify_trump_exchange(self, move) -> None:
-            if hasattr(self.inner, "notify_trump_exchange"):
-                self.inner.notify_trump_exchange(move)
-
-    # ------------------------------------------------------------------
-    # IMPORTANT: Tournament-style bot creation (ONE TIME, reused)
-    # ------------------------------------------------------------------
-    honest_inner = HonestBot(name="Honest")
-    rdeep_inner = RdeepBot(
-        num_samples=rdeep_samples,
-        depth=rdeep_depth,
-        rand=random.Random(4564654644),  # match honest_vs_rdeep style
-    )
-
-    honest = LoggingBot(honest_inner, "HB")
-    rdeep = LoggingBot(rdeep_inner, "RD")
-
-    bot1: Bot = honest
-    bot2: Bot = rdeep
-
-    wins = 0
-    losses: List[int] = []
-
-    with open(outfile, "w", encoding="utf-8") as f:
-        f.write("HonestBot vs RdeepBot — TOURNAMENT-STYLE LOSS DIAGNOSTICS\n\n")
-        f.write(f"settings: games={games}, seed0={seed0}, rdeep_samples={rdeep_samples}, rdeep_depth={rdeep_depth}\n\n")
-
-        for game_number in range(1, games + 1):
-            # swap seats every other game (exactly like honest_vs_rdeep)
-            if game_number % 2 == 0:
-                bot1, bot2 = bot2, bot1
-
-            # reset per-game logs
-            honest.reset_log()
-            rdeep.reset_log()
-
-            # match the other command’s RNG style (random.Random(game_number))
-            winner_id, game_points, score = engine.play_game(bot1, bot2, random.Random(game_number))
-
-            # count wins for the *Honest* wrapper object
-            if winner_id == honest:
-                wins += 1
-            else:
-                losses.append(game_number)
-                header = (
-                    f"\n=== LOSS game_number={game_number} (seed={game_number}) "
-                    f"bot1={type(bot1).__name__}:{getattr(bot1,'name', '')} "
-                    f"bot2={type(bot2).__name__}:{getattr(bot2,'name', '')} "
-                    f"winner={winner_id} points={game_points} score={score} ===\n"
-                )
-                f.write(header)
-                f.write("\n-- Move log (PI) --\n")
-                for line in honest.log:
-                    f.write(line + "\n")
-                f.write("\n-- Move log (RD) --\n")
-                for line in rdeep.log:
-                    f.write(line + "\n")
-
-                print(f"LOSS at game {game_number}: points={game_points}, score={score}")
-
-            # progress (every 5 games like your other function)
-            if game_number % 5 == 0:
-                print(
-                    f"Honest won {wins} out of {game_number} games "
-                    f"(last game: winner={winner_id}, points={game_points}, score={score})"
-                )
-
-        f.write(f"\nSUMMARY: wins={wins}/{games} ({wins/games:.1%})\n")
-        if losses:
-            f.write("\nLOSS GAME NUMBERS:\n")
-            for g in losses:
-                f.write(f"- {g}\n")
-
-    print(f"\nDONE. Wins={wins}/{games} ({wins/games:.1%})")
-    print(f"Wrote loss details to: {outfile}")
+@click.option('--seed', type=int, required=True)
+def debug_seed_as_leader(seed: int):
+    """Full trick-by-trick log – ONLY when HonestBot leads first (first seat)."""
+    detailed_game_for_seed_as_leader(seed)
 
 
 @main.command()
