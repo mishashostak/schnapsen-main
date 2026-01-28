@@ -237,7 +237,7 @@ def honest_vs_rdeep(
             rdeep = RdeepBot(
                 num_samples=rdeep_samples,
                 depth=rdeep_depth,
-                rand=random.Random(99999 + seed),
+                rand=random.Random(999999),
             )
 
             # Alternate seats every game:
@@ -1571,7 +1571,7 @@ def detailed_game_for_seed(seed: int) -> None:
     engine = SchnapsenGamePlayEngine()
 
     # Exact internal randomness for RDeep
-    rdeep_rand = random.Random(99999 + seed)
+    rdeep_rand = random.Random(999999)
 
     honest = HonestBot(name="HonestBot")
     rdeep = RdeepBot(num_samples=16, depth=4, rand=rdeep_rand)
@@ -1688,7 +1688,7 @@ def detailed_game_for_seed_as_leader(seed: int) -> None:
     engine = SchnapsenGamePlayEngine()
 
     # Exact internal randomness for RDeep
-    rdeep_rand = random.Random(99999 + seed)
+    rdeep_rand = random.Random(999999)
 
     honest = HonestBot(name="HonestBot")
     rdeep = RdeepBot(num_samples=16, depth=4, rand=rdeep_rand)
